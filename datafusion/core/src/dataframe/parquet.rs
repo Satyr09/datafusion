@@ -115,6 +115,7 @@ mod tests {
     use crate::execution::options::ParquetReadOptions;
     use crate::test_util::{self, register_aggregate_csv};
 
+    use datafusion_common::config::MaxRowGroupBytes;
     use datafusion_common::file_options::parquet_writer::parse_compression_string;
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::{col, lit};
@@ -261,6 +262,83 @@ mod tests {
 
             assert_eq!(written_rows as usize, rg_size);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_parquet_with_max_row_group_bytes_parallel() -> Result<()> {
+        // The parallel writer (allow_single_file_parallelism = true) must honor
+        // max_row_group_bytes: split the file into more than one row group and
+        // produce exactly the same row-group layout (row counts and byte sizes)
+        // as the single-threaded writer on the same input. The single-threaded
+        // writer delegates to arrow-rs's ArrowWriter, so matching it is the
+        // correctness oracle for the parallel implementation.
+        async fn write_and_read_row_groups(
+            allow_single_file_parallelism: bool,
+            max_row_group_bytes: usize,
+        ) -> Result<Vec<(i64, i64)>> {
+            let ctx = SessionContext::new_with_config(
+                SessionConfig::from_string_hash_map(&HashMap::from_iter(
+                    [("datafusion.execution.batch_size", "1024")]
+                        .iter()
+                        .map(|(s1, s2)| ((*s1).to_string(), (*s2).to_string())),
+                ))?,
+            );
+            let df = ctx
+                .sql("SELECT value AS id, value * 2 AS doubled FROM range(0, 8192)")
+                .await?;
+
+            let tmp_dir = TempDir::new()?;
+            let local = Arc::new(LocalFileSystem::new_with_prefix(&tmp_dir)?);
+            let local_url = Url::parse("file://local").unwrap();
+            ctx.register_object_store(&local_url, local);
+
+            let mut options = TableParquetOptions::default();
+            // A large row-count limit so only the byte limit drives the split.
+            options.global.max_row_group_size = 1_000_000;
+            options.global.max_row_group_bytes =
+                Some(MaxRowGroupBytes::try_new(max_row_group_bytes).unwrap());
+            options.global.allow_single_file_parallelism = allow_single_file_parallelism;
+
+            df.write_parquet(
+                "file://local/test.parquet",
+                DataFrameWriteOptions::new().with_single_file_output(true),
+                Some(options),
+            )
+            .await?;
+
+            let file = std::fs::File::open(tmp_dir.path().join("test.parquet"))?;
+            let reader =
+                parquet::file::serialized_reader::SerializedFileReader::new(file)
+                    .unwrap();
+            let metadata = reader.metadata();
+            Ok((0..metadata.num_row_groups())
+                .map(|i| {
+                    let rg = metadata.row_group(i);
+                    (rg.num_rows(), rg.total_byte_size())
+                })
+                .collect())
+        }
+
+        // A byte limit smaller than the dataset but larger than one batch, so
+        // the averaged-row-budget path runs (not just per-batch flushing).
+        let max_row_group_bytes = 4096;
+        let parallel = write_and_read_row_groups(true, max_row_group_bytes).await?;
+        let serial = write_and_read_row_groups(false, max_row_group_bytes).await?;
+
+        // The byte limit must actually split the file.
+        assert!(
+            parallel.len() > 1,
+            "expected multiple row groups from the parallel writer, got {}",
+            parallel.len()
+        );
+        // The parallel writer must produce the same row groups (row counts and
+        // byte sizes) as the single-threaded writer.
+        assert_eq!(
+            parallel, serial,
+            "parallel and single-threaded row-group layouts differ"
+        );
 
         Ok(())
     }
