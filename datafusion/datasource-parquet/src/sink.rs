@@ -62,6 +62,7 @@ use parquet::file::properties::{
 use parquet::file::writer::SerializedFileWriter;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::watch;
 
 /// Initial writing buffer size. Note this is just a size hint for efficiency. It
 /// will grow beyond the set value if needed.
@@ -413,43 +414,89 @@ impl DataSink for ParquetSink {
     }
 }
 
+/// Progress published by a [`column_serializer_task`] after each write so the
+/// parallel dispatcher can estimate the in-progress row group's encoded size.
+/// Only used when `max_row_group_bytes` is set.
+#[derive(Clone, Copy, Default)]
+struct ColSerializeProgress {
+    /// Number of arrays written so far in this row group (one per dispatched
+    /// `send_arrays_to_col_writers` call).
+    writes_done: u64,
+    /// `ArrowColumnWriter::get_estimated_total_bytes()` after the last write.
+    estimated_bytes: usize,
+}
+
 /// Consumes a stream of [ArrowLeafColumn] via a channel and serializes them using an [ArrowColumnWriter]
 /// Once the channel is exhausted, returns the ArrowColumnWriter.
+///
+/// When `progress_tx` is `Some` (i.e. a byte limit is set), it publishes the
+/// running write count and estimated encoded size after each write.
 async fn column_serializer_task(
     mut rx: Receiver<ArrowLeafColumn>,
     mut writer: ArrowColumnWriter,
     reservation: MemoryReservation,
     encoding_time: Time,
+    progress_tx: Option<watch::Sender<ColSerializeProgress>>,
 ) -> Result<(ArrowColumnWriter, MemoryReservation)> {
+    let mut writes_done: u64 = 0;
     while let Some(col) = rx.recv().await {
         let _timer = encoding_time.timer();
         writer.write(&col)?;
         reservation.try_resize(writer.memory_size())?;
+        if let Some(progress_tx) = &progress_tx {
+            writes_done += 1;
+            // Ignore send errors: the dispatcher may have stopped observing.
+            let _ = progress_tx.send(ColSerializeProgress {
+                writes_done,
+                estimated_bytes: writer.get_estimated_total_bytes(),
+            });
+        }
     }
     Ok((writer, reservation))
 }
 
 type ColumnWriterTask = SpawnedTask<Result<(ArrowColumnWriter, MemoryReservation)>>;
 type ColSender = Sender<ArrowLeafColumn>;
+type ColProgressReceiver = watch::Receiver<ColSerializeProgress>;
 
 /// Spawns a parallel serialization task for each column
 /// Returns join handles for each columns serialization task along with a send channel
 /// to send arrow arrays to each serialization task.
+///
+/// When `track_progress` is set (a byte limit is configured), each task is also
+/// given a [`watch`] sender and the matching receivers are returned so the
+/// dispatcher can observe per-column encoded sizes. When unset, the third
+/// returned vector is empty and no progress is published (no overhead).
 fn spawn_column_parallel_row_group_writer(
     col_writers: Vec<ArrowColumnWriter>,
     max_buffer_size: usize,
     pool: &Arc<dyn MemoryPool>,
     encoding_time: &Time,
-) -> Result<(Vec<ColumnWriterTask>, Vec<ColSender>)> {
+    track_progress: bool,
+) -> Result<(
+    Vec<ColumnWriterTask>,
+    Vec<ColSender>,
+    Vec<ColProgressReceiver>,
+)> {
     let num_columns = col_writers.len();
 
     let mut col_writer_tasks = Vec::with_capacity(num_columns);
     let mut col_array_channels = Vec::with_capacity(num_columns);
+    let mut col_progress_rxs =
+        Vec::with_capacity(if track_progress { num_columns } else { 0 });
     for writer in col_writers.into_iter() {
         // Buffer size of this channel limits the number of arrays queued up for column level serialization
         let (send_array, receive_array) =
             mpsc::channel::<ArrowLeafColumn>(max_buffer_size);
         col_array_channels.push(send_array);
+
+        let progress_tx = if track_progress {
+            let (tx, rx) = watch::channel(ColSerializeProgress::default());
+            col_progress_rxs.push(rx);
+            Some(tx)
+        } else {
+            None
+        };
 
         let reservation =
             MemoryConsumer::new("ParquetSink(ArrowColumnWriter)").register(pool);
@@ -458,11 +505,12 @@ fn spawn_column_parallel_row_group_writer(
             writer,
             reservation,
             encoding_time.clone(),
+            progress_tx,
         ));
         col_writer_tasks.push(task);
     }
 
-    Ok((col_writer_tasks, col_array_channels))
+    Ok((col_writer_tasks, col_array_channels, col_progress_rxs))
 }
 
 /// Settings related to writing parquet files in parallel
@@ -545,14 +593,160 @@ fn spawn_rg_join_and_finalize_task(
     })
 }
 
+/// Mutable state for the row group currently being assembled by the parallel
+/// writer: the per-column serialization tasks, their input channels, optional
+/// per-column size-progress receivers (only when a byte limit is set), and the
+/// running counters. Reset together at each row-group boundary.
+struct InProgressRowGroup {
+    column_writer_handles: Vec<ColumnWriterTask>,
+    col_array_channels: Vec<ColSender>,
+    col_progress_rxs: Vec<ColProgressReceiver>,
+    rows: usize,
+    /// Cumulative dispatched rows after each write: `cum_rows[k]` is the total
+    /// rows dispatched in the first `k` writes (`cum_rows[0] == 0`). Indexed by a
+    /// column's reported `writes_done` to recover how many rows that column has
+    /// actually encoded, so its byte estimate is divided by a consistent row
+    /// count. Only populated when a byte limit is set.
+    cum_rows: Vec<usize>,
+    /// Whether the once-per-row-group wait for the first column snapshot has
+    /// completed (see `ensure_first_snapshot`).
+    first_snapshot_done: bool,
+}
+
+/// Creates the column writers for `row_group_index` and spawns their parallel
+/// serialization tasks, returning a fresh [`InProgressRowGroup`].
+fn start_row_group(
+    row_group_writer_factory: &ArrowRowGroupWriterFactory,
+    row_group_index: usize,
+    ctx: &ParquetFileWriteContext,
+    encoding_time: &Time,
+    track_progress: bool,
+) -> Result<InProgressRowGroup> {
+    let col_writers = row_group_writer_factory.create_column_writers(row_group_index)?;
+    let (column_writer_handles, col_array_channels, col_progress_rxs) =
+        spawn_column_parallel_row_group_writer(
+            col_writers,
+            ctx.parallel_options.max_buffered_record_batches_per_stream,
+            &ctx.pool,
+            encoding_time,
+            track_progress,
+        )?;
+    Ok(InProgressRowGroup {
+        column_writer_handles,
+        col_array_channels,
+        col_progress_rxs,
+        rows: 0,
+        cum_rows: vec![0],
+        first_snapshot_done: false,
+    })
+}
+
+/// Finalizes the in-progress row group (joining its column tasks on a separate
+/// task and queueing the result for concatenation), then replaces `rg` with a
+/// fresh row group ready for the next rows.
+///
+/// Returns `Ok(false)` if the downstream channel has closed (the plan is
+/// shutting down), in which case the caller should stop.
+async fn finalize_and_start_next_row_group(
+    rg: &mut InProgressRowGroup,
+    row_group_index: &mut usize,
+    row_group_writer_factory: &ArrowRowGroupWriterFactory,
+    ctx: &ParquetFileWriteContext,
+    encoding_time: &Time,
+    serialize_tx: &Sender<SpawnedTask<RBStreamSerializeResult>>,
+    track_progress: bool,
+) -> Result<bool> {
+    let column_writer_handles = std::mem::take(&mut rg.column_writer_handles);
+    // Dropping the array channels signals the column tasks that the row group
+    // is complete so they can be joined.
+    rg.col_array_channels.clear();
+    rg.col_progress_rxs.clear();
+
+    let finalize_rg_task = spawn_rg_join_and_finalize_task(
+        column_writer_handles,
+        rg.rows,
+        &ctx.pool,
+        encoding_time.clone(),
+    );
+    if serialize_tx.send(finalize_rg_task).await.is_err() {
+        return Ok(false);
+    }
+
+    *row_group_index += 1;
+    *rg = start_row_group(
+        row_group_writer_factory,
+        *row_group_index,
+        ctx,
+        encoding_time,
+        track_progress,
+    )?;
+    Ok(true)
+}
+
+/// Projects the in-progress row group's encoded size from the latest per-column
+/// snapshots, without waiting. Each column reports `writes_done` and
+/// `estimated_bytes` together, so dividing its bytes by the rows it has actually
+/// encoded (`cum_rows[writes_done]`) yields a consistent average row size even
+/// when the snapshot is slightly stale. Bytes are summed across columns over the
+/// furthest-along row count, and the resulting average is projected onto the
+/// exact number of rows dispatched into the row group so far. Returns `None` if
+/// nothing has been encoded yet.
+///
+/// This is the v2 (passive projection) estimator: unlike a strict per-batch
+/// barrier it never awaits in steady state, preserving inter-batch pipelining.
+/// Staleness only perturbs the average (a ratio), which self-corrects each batch.
+fn projected_rg_bytes(
+    col_progress_rxs: &[ColProgressReceiver],
+    cum_rows: &[usize],
+    current_rg_rows: usize,
+) -> Option<usize> {
+    let (rows, bytes) =
+        col_progress_rxs
+            .iter()
+            .fold((0usize, 0usize), |(rows, bytes), rx| {
+                let p = *rx.borrow();
+                (
+                    rows.max(cum_rows[p.writes_done as usize]),
+                    bytes + p.estimated_bytes,
+                )
+            });
+    if rows == 0 {
+        return None;
+    }
+    let avg_row_bytes = (bytes / rows).max(1);
+    Some(avg_row_bytes * current_rg_rows)
+}
+
+/// Waits, at most once per row group, for the first progress report from every
+/// column. This removes the start-of-row-group race where no measurement has
+/// landed when the second batch is sized (which otherwise makes tiny byte limits
+/// scheduling-dependent); after it returns, the steady state is barrier-free.
+/// Returns `false` if a column task has exited (the plan is shutting down).
+async fn ensure_first_snapshot(
+    col_progress_rxs: &mut [ColProgressReceiver],
+    first_snapshot_done: &mut bool,
+) -> bool {
+    if !*first_snapshot_done {
+        for rx in col_progress_rxs.iter_mut() {
+            if rx.wait_for(|p| p.writes_done > 0).await.is_err() {
+                return false;
+            }
+        }
+        *first_snapshot_done = true;
+    }
+    true
+}
+
 /// This task coordinates the serialization of a parquet file in parallel.
-/// As the query produces RecordBatches, these are written to a RowGroup
-/// via parallel [ArrowColumnWriter] tasks. Once the desired max rows per
-/// row group is reached, the parallel tasks are joined on another separate task
-/// and sent to a concatenation task. This task immediately continues to work
-/// on the next row group in parallel. So, parquet serialization is parallelized
-/// across both columns and row_groups, with a theoretical max number of parallel tasks
-/// given by n_columns * num_row_groups.
+/// As the query produces RecordBatches, these are written to a RowGroup via
+/// parallel [ArrowColumnWriter] tasks. Row-group boundaries honor both
+/// `max_row_group_size` (rows) and `max_row_group_bytes` (estimated encoded
+/// size), flushing on whichever limit is reached first, mirroring the
+/// single-threaded `ArrowWriter`. Once a boundary is reached the parallel tasks
+/// are joined on another separate task and sent to a concatenation task, while
+/// this task immediately continues on the next row group. So, parquet
+/// serialization is parallelized across both columns and row_groups, with a
+/// theoretical max number of parallel tasks given by n_columns * num_row_groups.
 fn spawn_parquet_parallel_serialization_task(
     row_group_writer_factory: ArrowRowGroupWriterFactory,
     mut data: Receiver<RecordBatch>,
@@ -561,93 +755,152 @@ fn spawn_parquet_parallel_serialization_task(
     encoding_time: Time,
 ) -> SpawnedTask<Result<(), DataFusionError>> {
     SpawnedTask::spawn(async move {
-        let max_buffer_rb = ctx.parallel_options.max_buffered_record_batches_per_stream;
         let max_row_group_rows = ctx
             .props
             .max_row_group_row_count()
             .unwrap_or(DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
+        // The byte limit is best-effort and predictive, matching ArrowWriter:
+        // the first batch of a row group is written whole, then the average
+        // encoded bytes/row observed so far bounds how many rows of the next
+        // batch fit. Only when a byte limit is set do we track per-column sizes.
+        let max_row_group_bytes = ctx.props.max_row_group_bytes();
+        let track_progress = max_row_group_bytes.is_some();
+        let max_bytes = max_row_group_bytes.unwrap_or(usize::MAX);
+
         let mut row_group_index = 0;
-        let col_writers =
-            row_group_writer_factory.create_column_writers(row_group_index)?;
-        let (mut column_writer_handles, mut col_array_channels) =
-            spawn_column_parallel_row_group_writer(
-                col_writers,
-                max_buffer_rb,
-                &ctx.pool,
-                &encoding_time,
-            )?;
-        let mut current_rg_rows = 0;
+        let mut rg = start_row_group(
+            &row_group_writer_factory,
+            row_group_index,
+            &ctx,
+            &encoding_time,
+            track_progress,
+        )?;
 
         while let Some(mut rb) = data.recv().await {
-            // This loop allows the "else" block to repeatedly split the RecordBatch to handle the case
-            // when max_row_group_rows < execution.batch_size as an alternative to a recursive async
-            // function.
+            // This loop re-slices `rb` so a single batch can span multiple row
+            // groups when it exceeds the row or byte limit.
             loop {
-                if current_rg_rows + rb.num_rows() < max_row_group_rows {
-                    send_arrays_to_col_writers(
-                        &col_array_channels,
-                        &rb,
-                        Arc::clone(&ctx.schema),
-                    )
-                    .await?;
-                    current_rg_rows += rb.num_rows();
-                    break;
+                let remaining_by_rows = max_row_group_rows - rg.rows;
+                // The first write of a row group is always accepted whole (no
+                // average exists yet), matching ArrowWriter.
+                let remaining_by_bytes = if !track_progress || rg.rows == 0 {
+                    usize::MAX
                 } else {
-                    let rows_left = max_row_group_rows - current_rg_rows;
-                    let a = rb.slice(0, rows_left);
-                    send_arrays_to_col_writers(
-                        &col_array_channels,
-                        &a,
-                        Arc::clone(&ctx.schema),
+                    // Wait once per row group for the first snapshot, then read
+                    // the latest per-column snapshots without blocking and
+                    // project onto the exact dispatched row count.
+                    if !ensure_first_snapshot(
+                        &mut rg.col_progress_rxs,
+                        &mut rg.first_snapshot_done,
                     )
-                    .await?;
-
-                    // Signal the parallel column writers that the RowGroup is done, join and finalize RowGroup
-                    // on a separate task, so that we can immediately start on the next RG before waiting
-                    // for the current one to finish.
-                    drop(col_array_channels);
-                    let finalize_rg_task = spawn_rg_join_and_finalize_task(
-                        column_writer_handles,
-                        max_row_group_rows,
-                        &ctx.pool,
-                        encoding_time.clone(),
-                    );
-
-                    // Do not surface error from closed channel (means something
-                    // else hit an error, and the plan is shutting down).
-                    if serialize_tx.send(finalize_rg_task).await.is_err() {
+                    .await
+                    {
                         return Ok(());
                     }
+                    match projected_rg_bytes(&rg.col_progress_rxs, &rg.cum_rows, rg.rows)
+                    {
+                        None => usize::MAX,
+                        Some(proj) if proj >= max_bytes => 0,
+                        Some(proj) => {
+                            let avg_row_bytes = (proj / rg.rows).max(1);
+                            (max_bytes - proj) / avg_row_bytes
+                        }
+                    }
+                };
 
-                    current_rg_rows = 0;
-                    rb = rb.slice(rows_left, rb.num_rows() - rows_left);
+                let n = rb.num_rows().min(remaining_by_rows).min(remaining_by_bytes);
 
-                    row_group_index += 1;
-                    let col_writers = row_group_writer_factory
-                        .create_column_writers(row_group_index)?;
-                    (column_writer_handles, col_array_channels) =
-                        spawn_column_parallel_row_group_writer(
-                            col_writers,
-                            max_buffer_rb,
-                            &ctx.pool,
+                if n == 0 {
+                    // Current row group is full (rows or bytes); flush and retry
+                    // the same batch against a fresh one.
+                    if !finalize_and_start_next_row_group(
+                        &mut rg,
+                        &mut row_group_index,
+                        &row_group_writer_factory,
+                        &ctx,
+                        &encoding_time,
+                        &serialize_tx,
+                        track_progress,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                send_arrays_to_col_writers(
+                    &rg.col_array_channels,
+                    &rb.slice(0, n),
+                    Arc::clone(&ctx.schema),
+                )
+                .await?;
+                rg.rows += n;
+                // Record the cumulative dispatched-row count so a column's
+                // reported `writes_done` maps back to the rows it has encoded.
+                if track_progress {
+                    let total = rg.cum_rows.last().copied().unwrap_or(0) + n;
+                    rg.cum_rows.push(total);
+                }
+
+                if n == rb.num_rows() {
+                    // Whole batch consumed. Flush eagerly when the row limit is
+                    // hit exactly (preserves the prior row-count behavior).
+                    if rg.rows >= max_row_group_rows
+                        && !finalize_and_start_next_row_group(
+                            &mut rg,
+                            &mut row_group_index,
+                            &row_group_writer_factory,
+                            &ctx,
                             &encoding_time,
-                        )?;
+                            &serialize_tx,
+                            track_progress,
+                        )
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                    break;
+                }
+
+                // Batch had more rows than fit; flush and continue with the rest.
+                rb = rb.slice(n, rb.num_rows() - n);
+                if !finalize_and_start_next_row_group(
+                    &mut rg,
+                    &mut row_group_index,
+                    &row_group_writer_factory,
+                    &ctx,
+                    &encoding_time,
+                    &serialize_tx,
+                    track_progress,
+                )
+                .await?
+                {
+                    return Ok(());
                 }
             }
         }
 
+        // Handle leftover rows as the final row group, which may be smaller than
+        // either limit.
+        let InProgressRowGroup {
+            column_writer_handles,
+            col_array_channels,
+            col_progress_rxs,
+            rows,
+            ..
+        } = rg;
         drop(col_array_channels);
-        // Handle leftover rows as final rowgroup, which may be smaller than max_row_group_rows
-        if current_rg_rows > 0 {
+        drop(col_progress_rxs);
+        if rows > 0 {
             let finalize_rg_task = spawn_rg_join_and_finalize_task(
                 column_writer_handles,
-                current_rg_rows,
+                rows,
                 &ctx.pool,
                 encoding_time.clone(),
             );
-
-            // Do not surface error from closed channel (means something
-            // else hit an error, and the plan is shutting down).
+            // Do not surface error from closed channel (means something else hit
+            // an error, and the plan is shutting down).
             if serialize_tx.send(finalize_rg_task).await.is_err() {
                 return Ok(());
             }
