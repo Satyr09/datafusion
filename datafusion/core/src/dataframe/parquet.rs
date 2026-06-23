@@ -343,6 +343,61 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn parallel_writer_with_byte_limit_handles_empty_batches() -> Result<()> {
+        use crate::arrow::array::Int64Array;
+        use crate::arrow::datatypes::{DataType, Field, Schema};
+        use crate::datasource::MemTable;
+        use std::time::Duration;
+
+        // The demux forwards empty batches to the row-group dispatcher, so the
+        // parallel writer must not hang on one. Feed an empty batch ahead of real
+        // data with a byte limit set, and guard with a timeout so a regression
+        // fails the test instead of hanging.
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from((0..4096).collect::<Vec<i64>>()))],
+        )?;
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![empty, data]])?;
+
+        let ctx = SessionContext::new_with_config(SessionConfig::from_string_hash_map(
+            &HashMap::from_iter(
+                [("datafusion.execution.target_partitions", "1")]
+                    .iter()
+                    .map(|(s1, s2)| ((*s1).to_string(), (*s2).to_string())),
+            ),
+        )?);
+        ctx.register_table("t", Arc::new(table))?;
+
+        let tmp_dir = TempDir::new()?;
+        let local = Arc::new(LocalFileSystem::new_with_prefix(&tmp_dir)?);
+        let local_url = Url::parse("file://local").unwrap();
+        ctx.register_object_store(&local_url, local);
+
+        let mut options = TableParquetOptions::default();
+        options.global.max_row_group_bytes = Some(MaxRowGroupBytes::try_new(1).unwrap());
+        options.global.allow_single_file_parallelism = true;
+
+        let write = ctx.table("t").await?.write_parquet(
+            "file://local/test.parquet",
+            DataFrameWriteOptions::new().with_single_file_output(true),
+            Some(options),
+        );
+        tokio::time::timeout(Duration::from_secs(30), write)
+            .await
+            .expect("parallel writer hung on an empty batch")?;
+
+        let file = std::fs::File::open(tmp_dir.path().join("test.parquet"))?;
+        let reader =
+            parquet::file::serialized_reader::SerializedFileReader::new(file).unwrap();
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 4096);
+
+        Ok(())
+    }
+
     #[rstest::rstest]
     #[cfg(feature = "parquet_encryption")]
     #[tokio::test]

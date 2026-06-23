@@ -651,7 +651,6 @@ async fn finalize_and_start_next_row_group(
     // Dropping the array channels signals the column tasks that the row group
     // is complete so they can be joined.
     rg.col_array_channels.clear();
-    rg.col_progress_rxs.clear();
 
     let finalize_rg_task = spawn_rg_join_and_finalize_task(
         column_writer_handles,
@@ -736,6 +735,11 @@ fn spawn_parquet_parallel_serialization_task(
         )?;
 
         while let Some(mut rb) = data.recv().await {
+            // Skip empty batches: they carry no rows to place, and feeding one
+            // into the loop below would make `n == 0` flush and retry forever.
+            if rb.num_rows() == 0 {
+                continue;
+            }
             // This loop re-slices `rb` so a single batch can span multiple row
             // groups when it exceeds the row or byte limit.
             loop {
