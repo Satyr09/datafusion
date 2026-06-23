@@ -275,6 +275,7 @@ mod tests {
         // the same ballpark (comparable group count, no grossly larger group).
         // The single-threaded writer (arrow-rs's ArrowWriter) is the reference.
         async fn write_and_read_row_groups(
+            query: &str,
             allow_single_file_parallelism: bool,
             max_row_group_bytes: usize,
         ) -> Result<Vec<(i64, i64)>> {
@@ -285,9 +286,7 @@ mod tests {
                         .map(|(s1, s2)| ((*s1).to_string(), (*s2).to_string())),
                 ))?,
             );
-            let df = ctx
-                .sql("SELECT value AS id, value * 2 AS doubled FROM range(0, 8192)")
-                .await?;
+            let df = ctx.sql(query).await?;
 
             let tmp_dir = TempDir::new()?;
             let local = Arc::new(LocalFileSystem::new_with_prefix(&tmp_dir)?);
@@ -321,34 +320,101 @@ mod tests {
                 .collect())
         }
 
-        // A byte limit smaller than the dataset but larger than one batch, so
-        // the averaged-row-budget path runs (not just per-batch flushing).
-        let max_row_group_bytes = 4096;
-        let parallel = write_and_read_row_groups(true, max_row_group_bytes).await?;
-        let serial = write_and_read_row_groups(false, max_row_group_bytes).await?;
-
-        // The byte limit must actually split the file in the parallel writer.
-        assert!(
-            parallel.len() > 1,
-            "expected multiple row groups from the parallel writer, got {}",
-            parallel.len()
-        );
-        // Approximate parity with the single-threaded writer: a comparable number
-        // of row groups, and no group grossly larger than its largest.
         let max_group =
             |groups: &[(i64, i64)]| groups.iter().map(|(_, b)| *b).max().unwrap_or(0);
-        assert!(
-            parallel.len() * 2 >= serial.len() && serial.len() * 2 >= parallel.len(),
-            "parallel ({}) and single-threaded ({}) row-group counts differ wildly",
-            parallel.len(),
-            serial.len()
+        // Uniform columns, and a skewed mix (a cheap int column beside an
+        // expensive wide-string column). The skewed case exercises the
+        // per-column average that keeps a faster column from biasing the
+        // estimate. A byte limit smaller than the dataset but larger than one
+        // batch makes the averaged-row-budget path run (not just per-batch).
+        let queries = [
+            "SELECT value AS id, value * 2 AS doubled FROM range(0, 8192)",
+            "SELECT value AS id, lpad(arrow_cast(value, 'Utf8'), 100, '0') AS s \
+             FROM range(0, 8192)",
+        ];
+        let max_row_group_bytes = 4096;
+        for query in queries {
+            let parallel =
+                write_and_read_row_groups(query, true, max_row_group_bytes).await?;
+            let serial =
+                write_and_read_row_groups(query, false, max_row_group_bytes).await?;
+
+            // The byte limit must actually split the file in the parallel writer.
+            assert!(
+                parallel.len() > 1,
+                "parallel writer produced {} row group(s) for `{query}`",
+                parallel.len()
+            );
+            // Approximate parity with the single-threaded writer: a comparable
+            // group count, and no group grossly larger than its largest.
+            assert!(
+                parallel.len() * 2 >= serial.len() && serial.len() * 2 >= parallel.len(),
+                "parallel ({}) vs single-threaded ({}) row-group counts differ wildly for `{query}`",
+                parallel.len(),
+                serial.len()
+            );
+            assert!(
+                max_group(&parallel) <= max_group(&serial) * 2,
+                "parallel largest row group ({}) far exceeds single-threaded ({}) for `{query}`",
+                max_group(&parallel),
+                max_group(&serial)
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_writer_with_byte_limit_handles_empty_batches() -> Result<()> {
+        use crate::arrow::array::Int64Array;
+        use crate::arrow::datatypes::{DataType, Field, Schema};
+        use crate::datasource::MemTable;
+        use std::time::Duration;
+
+        // The demux forwards empty batches to the row-group dispatcher, so the
+        // parallel writer must not hang on one. Feed an empty batch ahead of real
+        // data with a byte limit set, and guard with a timeout so a regression
+        // fails the test instead of hanging.
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from((0..4096).collect::<Vec<i64>>()))],
+        )?;
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![empty, data]])?;
+
+        let ctx = SessionContext::new_with_config(SessionConfig::from_string_hash_map(
+            &HashMap::from_iter(
+                [("datafusion.execution.target_partitions", "1")]
+                    .iter()
+                    .map(|(s1, s2)| ((*s1).to_string(), (*s2).to_string())),
+            ),
+        )?);
+        ctx.register_table("t", Arc::new(table))?;
+
+        let tmp_dir = TempDir::new()?;
+        let local = Arc::new(LocalFileSystem::new_with_prefix(&tmp_dir)?);
+        let local_url = Url::parse("file://local").unwrap();
+        ctx.register_object_store(&local_url, local);
+
+        let mut options = TableParquetOptions::default();
+        options.global.max_row_group_bytes = Some(MaxRowGroupBytes::try_new(1).unwrap());
+        options.global.allow_single_file_parallelism = true;
+
+        let write = ctx.table("t").await?.write_parquet(
+            "file://local/test.parquet",
+            DataFrameWriteOptions::new().with_single_file_output(true),
+            Some(options),
         );
-        assert!(
-            max_group(&parallel) <= max_group(&serial) * 2,
-            "parallel largest row group ({}) far exceeds single-threaded ({})",
-            max_group(&parallel),
-            max_group(&serial)
-        );
+        tokio::time::timeout(Duration::from_secs(30), write)
+            .await
+            .expect("parallel writer hung on an empty batch")?;
+
+        let file = std::fs::File::open(tmp_dir.path().join("test.parquet"))?;
+        let reader =
+            parquet::file::serialized_reader::SerializedFileReader::new(file).unwrap();
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 4096);
 
         Ok(())
     }

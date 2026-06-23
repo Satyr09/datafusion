@@ -636,7 +636,8 @@ fn start_row_group(
         col_array_channels,
         col_progress_rxs,
         rows: 0,
-        cum_rows: vec![0],
+        // Only used when a byte limit is set; skip the allocation otherwise.
+        cum_rows: if track_progress { vec![0] } else { Vec::new() },
         first_snapshot_done: false,
     })
 }
@@ -660,7 +661,6 @@ async fn finalize_and_start_next_row_group(
     // Dropping the array channels signals the column tasks that the row group
     // is complete so they can be joined.
     rg.col_array_channels.clear();
-    rg.col_progress_rxs.clear();
 
     let finalize_rg_task = spawn_rg_join_and_finalize_task(
         column_writer_handles,
@@ -683,38 +683,38 @@ async fn finalize_and_start_next_row_group(
     Ok(true)
 }
 
-/// Projects the in-progress row group's encoded size from the latest per-column
-/// snapshots, without waiting. Each column reports `writes_done` and
-/// `estimated_bytes` together, so dividing its bytes by the rows it has actually
-/// encoded (`cum_rows[writes_done]`) yields a consistent average row size even
-/// when the snapshot is slightly stale. Bytes are summed across columns over the
-/// furthest-along row count, and the resulting average is projected onto the
-/// exact number of rows dispatched into the row group so far. Returns `None` if
-/// nothing has been encoded yet.
+/// Estimates the average encoded bytes per row of the in-progress row group from
+/// the latest per-column snapshots, without waiting. Each column reports
+/// `writes_done` and `estimated_bytes` together, so dividing its bytes by the
+/// rows it has actually encoded (`cum_rows[writes_done]`) yields a per-column
+/// average from a mutually consistent pair, even when the snapshot is slightly
+/// stale. Summing those per-column averages avoids letting a faster (further
+/// along) column skew the result, which `sum(bytes) / max(rows)` would do by
+/// pairing one column's row count with another's bytes. Returns `None` if no
+/// column has encoded anything yet.
 ///
 /// This is the v2 (passive projection) estimator: unlike a strict per-batch
 /// barrier it never awaits in steady state, preserving inter-batch pipelining.
-/// Staleness only perturbs the average (a ratio), which self-corrects each batch.
-fn projected_rg_bytes(
+/// Staleness only perturbs the averages (ratios), which self-correct each batch.
+fn estimate_avg_row_bytes(
     col_progress_rxs: &[ColProgressReceiver],
     cum_rows: &[usize],
-    current_rg_rows: usize,
 ) -> Option<usize> {
-    let (rows, bytes) =
-        col_progress_rxs
-            .iter()
-            .fold((0usize, 0usize), |(rows, bytes), rx| {
-                let p = *rx.borrow();
-                (
-                    rows.max(cum_rows[p.writes_done as usize]),
-                    bytes + p.estimated_bytes,
-                )
-            });
-    if rows == 0 {
-        return None;
+    let mut avg_row_bytes = 0usize;
+    let mut measured = false;
+    for rx in col_progress_rxs.iter() {
+        let p = *rx.borrow();
+        // `checked_div` yields `None` for a column that has not encoded any rows
+        // yet, which we simply skip.
+        if let Some(avg) = p
+            .estimated_bytes
+            .checked_div(cum_rows[p.writes_done as usize])
+        {
+            avg_row_bytes += avg;
+            measured = true;
+        }
     }
-    let avg_row_bytes = (bytes / rows).max(1);
-    Some(avg_row_bytes * current_rg_rows)
+    measured.then_some(avg_row_bytes)
 }
 
 /// Waits, at most once per row group, for the first progress report from every
@@ -741,8 +741,9 @@ async fn ensure_first_snapshot(
 /// As the query produces RecordBatches, these are written to a RowGroup via
 /// parallel [ArrowColumnWriter] tasks. Row-group boundaries honor both
 /// `max_row_group_size` (rows) and `max_row_group_bytes` (estimated encoded
-/// size), flushing on whichever limit is reached first, mirroring the
-/// single-threaded `ArrowWriter`. Once a boundary is reached the parallel tasks
+/// size), flushing on whichever limit is reached first. The byte boundary is a
+/// best-effort approximation of the single-threaded `ArrowWriter` (see
+/// `estimate_avg_row_bytes`). Once a boundary is reached the parallel tasks
 /// are joined on another separate task and sent to a concatenation task, while
 /// this task immediately continues on the next row group. So, parquet
 /// serialization is parallelized across both columns and row_groups, with a
@@ -777,6 +778,11 @@ fn spawn_parquet_parallel_serialization_task(
         )?;
 
         while let Some(mut rb) = data.recv().await {
+            // Skip empty batches: they carry no rows to place, and feeding one
+            // into the loop below would make `n == 0` flush and retry forever.
+            if rb.num_rows() == 0 {
+                continue;
+            }
             // This loop re-slices `rb` so a single batch can span multiple row
             // groups when it exceeds the row or byte limit.
             loop {
@@ -797,13 +803,15 @@ fn spawn_parquet_parallel_serialization_task(
                     {
                         return Ok(());
                     }
-                    match projected_rg_bytes(&rg.col_progress_rxs, &rg.cum_rows, rg.rows)
-                    {
+                    match estimate_avg_row_bytes(&rg.col_progress_rxs, &rg.cum_rows) {
                         None => usize::MAX,
-                        Some(proj) if proj >= max_bytes => 0,
-                        Some(proj) => {
-                            let avg_row_bytes = (proj / rg.rows).max(1);
-                            (max_bytes - proj) / avg_row_bytes
+                        Some(avg_row_bytes) => {
+                            let projected = avg_row_bytes * rg.rows;
+                            if projected >= max_bytes {
+                                0
+                            } else {
+                                (max_bytes - projected) / avg_row_bytes.max(1)
+                            }
                         }
                     }
                 };
