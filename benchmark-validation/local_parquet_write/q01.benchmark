@@ -1,0 +1,20 @@
+name narrow_parallel_rows
+group local_parquet_write
+subgroup narrow
+
+load
+SET datafusion.execution.batch_size = 2048;
+SET datafusion.execution.target_partitions = 1;
+CREATE TABLE source_data AS SELECT value * 1 AS n0, value * 3 AS n1, value * 5 AS n2, value * 7 AS n3 FROM range(0, 131072);
+
+init
+SET datafusion.execution.parquet.allow_single_file_parallelism = true;
+SET datafusion.execution.parquet.maximum_parallel_row_group_writers = 2;
+SET datafusion.execution.parquet.maximum_buffered_record_batches_per_stream = 2;
+RESET datafusion.execution.parquet.max_row_group_bytes;
+
+run
+COPY source_data TO '${WRITE_OUTPUT_DIR}/narrow_parallel_rows.parquet' STORED AS PARQUET OPTIONS ('format.max_row_group_size' 1000000);
+
+cleanup
+DROP TABLE source_data;

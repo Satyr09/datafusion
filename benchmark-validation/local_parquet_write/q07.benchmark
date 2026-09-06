@@ -1,0 +1,20 @@
+name rotating_parallel_rows
+group local_parquet_write
+subgroup rotating
+
+load
+SET datafusion.execution.batch_size = 2048;
+SET datafusion.execution.target_partitions = 1;
+CREATE TABLE source_data AS SELECT CASE WHEN ((value / 2048)::BIGINT % 4) = 0 THEN concat(md5(CAST(value * 7 + 0 AS VARCHAR)), md5(CAST(value * 7 + 1 AS VARCHAR)), md5(CAST(value * 7 + 2 AS VARCHAR)), md5(CAST(value * 7 + 3 AS VARCHAR))) ELSE substr(md5(CAST(value * 7 + 0 AS VARCHAR)), 1, 8) END AS s0, CASE WHEN ((value / 2048)::BIGINT % 4) = 1 THEN concat(md5(CAST(value * 7 + 4 AS VARCHAR)), md5(CAST(value * 7 + 5 AS VARCHAR)), md5(CAST(value * 7 + 6 AS VARCHAR)), md5(CAST(value * 7 + 7 AS VARCHAR))) ELSE substr(md5(CAST(value * 7 + 1 AS VARCHAR)), 1, 8) END AS s1, CASE WHEN ((value / 2048)::BIGINT % 4) = 2 THEN concat(md5(CAST(value * 7 + 8 AS VARCHAR)), md5(CAST(value * 7 + 9 AS VARCHAR)), md5(CAST(value * 7 + 10 AS VARCHAR)), md5(CAST(value * 7 + 11 AS VARCHAR))) ELSE substr(md5(CAST(value * 7 + 2 AS VARCHAR)), 1, 8) END AS s2, CASE WHEN ((value / 2048)::BIGINT % 4) = 3 THEN concat(md5(CAST(value * 7 + 12 AS VARCHAR)), md5(CAST(value * 7 + 13 AS VARCHAR)), md5(CAST(value * 7 + 14 AS VARCHAR)), md5(CAST(value * 7 + 15 AS VARCHAR))) ELSE substr(md5(CAST(value * 7 + 3 AS VARCHAR)), 1, 8) END AS s3 FROM range(0, 131072);
+
+init
+SET datafusion.execution.parquet.allow_single_file_parallelism = true;
+SET datafusion.execution.parquet.maximum_parallel_row_group_writers = 2;
+SET datafusion.execution.parquet.maximum_buffered_record_batches_per_stream = 2;
+RESET datafusion.execution.parquet.max_row_group_bytes;
+
+run
+COPY source_data TO '${WRITE_OUTPUT_DIR}/rotating_parallel_rows.parquet' STORED AS PARQUET OPTIONS ('format.max_row_group_size' 1000000);
+
+cleanup
+DROP TABLE source_data;

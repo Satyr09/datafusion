@@ -1,0 +1,20 @@
+name booleans_parallel_bytes
+group local_parquet_write
+subgroup booleans
+
+load
+SET datafusion.execution.batch_size = 2048;
+SET datafusion.execution.target_partitions = 1;
+CREATE TABLE source_data AS SELECT (value % 3) < 1 AS b0, (value % 5) < 2 AS b1, (value % 7) < 3 AS b2, (value % 9) < 4 AS b3, (value % 11) < 5 AS b4, (value % 13) < 6 AS b5, (value % 15) < 7 AS b6, (value % 17) < 8 AS b7, (value % 19) < 9 AS b8, (value % 21) < 10 AS b9, (value % 23) < 11 AS b10, (value % 25) < 12 AS b11, (value % 27) < 13 AS b12, (value % 29) < 14 AS b13, (value % 31) < 15 AS b14, (value % 33) < 16 AS b15, (value % 35) < 17 AS b16, (value % 37) < 18 AS b17, (value % 39) < 19 AS b18, (value % 41) < 20 AS b19, (value % 43) < 21 AS b20, (value % 45) < 22 AS b21, (value % 47) < 23 AS b22, (value % 49) < 24 AS b23, (value % 51) < 25 AS b24, (value % 53) < 26 AS b25, (value % 55) < 27 AS b26, (value % 57) < 28 AS b27, (value % 59) < 29 AS b28, (value % 61) < 30 AS b29, (value % 63) < 31 AS b30, (value % 65) < 32 AS b31, (value % 67) < 33 AS b32, (value % 69) < 34 AS b33, (value % 71) < 35 AS b34, (value % 73) < 36 AS b35, (value % 75) < 37 AS b36, (value % 77) < 38 AS b37, (value % 79) < 39 AS b38, (value % 81) < 40 AS b39, (value % 83) < 41 AS b40, (value % 85) < 42 AS b41, (value % 87) < 43 AS b42, (value % 89) < 44 AS b43, (value % 91) < 45 AS b44, (value % 93) < 46 AS b45, (value % 95) < 47 AS b46, (value % 97) < 48 AS b47, (value % 99) < 49 AS b48, (value % 101) < 50 AS b49, (value % 103) < 51 AS b50, (value % 105) < 52 AS b51, (value % 107) < 53 AS b52, (value % 109) < 54 AS b53, (value % 111) < 55 AS b54, (value % 113) < 56 AS b55, (value % 115) < 57 AS b56, (value % 117) < 58 AS b57, (value % 119) < 59 AS b58, (value % 121) < 60 AS b59, (value % 123) < 61 AS b60, (value % 125) < 62 AS b61, (value % 127) < 63 AS b62, (value % 129) < 64 AS b63 FROM range(0, 131072);
+
+init
+SET datafusion.execution.parquet.allow_single_file_parallelism = true;
+SET datafusion.execution.parquet.maximum_parallel_row_group_writers = 2;
+SET datafusion.execution.parquet.maximum_buffered_record_batches_per_stream = 2;
+RESET datafusion.execution.parquet.max_row_group_bytes;
+
+run
+COPY source_data TO '${WRITE_OUTPUT_DIR}/booleans_parallel_bytes.parquet' STORED AS PARQUET OPTIONS ('format.max_row_group_size' 1000000, 'format.max_row_group_bytes' 262144);
+
+cleanup
+DROP TABLE source_data;
