@@ -57,8 +57,21 @@ jobs:
           workspaces: engine -> ../target
           shared-key: parallel-parquet-197
           cache-on-failure: true
-      - name: Build and compare on the same machine
-        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results
+          cache-workspace-crates: true
+      - name: Build original writer
+        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results build-base
+      - name: Smoke-test original writer
+        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results smoke-base
+      - name: Build v1
+        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results build-v1
+      - name: Smoke-test v1
+        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results smoke-v1
+      - name: Build v2
+        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results build-v2
+      - name: Smoke-test v2
+        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results smoke-v2
+      - name: Run both comparison rounds
+        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results compare
       - name: Publish comparison summary
         if: success()
         run: cat results/reports/comparison.md >> "$GITHUB_STEP_SUMMARY"

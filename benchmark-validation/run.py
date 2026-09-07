@@ -27,7 +27,9 @@ import time
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-engine, output = [Path(p).resolve() for p in sys.argv[1:]]
+engine, output = [Path(p).resolve() for p in sys.argv[1:3]]
+phase = sys.argv[3] if len(sys.argv) > 3 else 'all'
+assert phase in {'all', 'compare', 'build-base', 'build-v1', 'build-v2', 'smoke-base', 'smoke-v1', 'smoke-v2'}
 reports = output / 'reports'
 reports.mkdir(parents=True, exist_ok=True)
 variants = {
@@ -50,6 +52,10 @@ def run(command, log, cwd=engine):
 
 common = ['--partitions', '1', '--batch-size', '2048', '--memory-limit', '2G', '--mem-pool-type', 'greedy']
 reference_hashes = {}
+reference_layout = reports / 'base/smoke/layout.json'
+if reference_layout.exists():
+    for entry in json.loads(reference_layout.read_text()):
+        reference_hashes[entry['case'].split('_')[0]] = entry['content_sha256']
 
 def measure(variant, label, iterations):
     report = reports / variant / label
@@ -108,6 +114,8 @@ binaries = output / 'binaries'
 binaries.mkdir(exist_ok=True)
 try:
     for variant, commit in variants.items():
+        if phase not in {'all', f'build-{variant}'}:
+            continue
         variant_config = subprocess.check_output(['git', 'show', f'{commit}:{config_path}'], cwd=engine, text=True)
         assert without_docs(config) == without_docs(variant_config)
         source = subprocess.check_output(['git', 'show', f'{commit}:datafusion/datasource-parquet/src/sink.rs'], cwd=engine)
@@ -123,11 +131,15 @@ try:
             'note': 'Only sink.rs changes between builds; config code is identical and descriptions stay at base.'
         }, indent=2))
         # Smoke-test repeated COPY and readback before building the next writer.
-        measure(variant, 'smoke', 2)
+        if phase == 'all':
+            measure(variant, 'smoke', 2)
 finally:
     sink.write_bytes(original)
 
-for round_number, order in enumerate([list(variants), list(reversed(variants))], 1):
-    for variant in order:
-        measure(variant, f'round-{round_number}', 7)
-subprocess.run([sys.executable, str(Path(__file__).with_name('summarize.py')), str(reports)], check=True)
+if phase.startswith('smoke-'):
+    measure(phase.removeprefix('smoke-'), 'smoke', 2)
+if phase in {'all', 'compare'}:
+    for round_number, order in enumerate([list(variants), list(reversed(variants))], 1):
+        for variant in order:
+            measure(variant, f'round-{round_number}', 7)
+    subprocess.run([sys.executable, str(Path(__file__).with_name('summarize.py')), str(reports)], check=True)
