@@ -66,11 +66,11 @@ with (root / 'comparison.csv').open('w', newline='') as output:
     writer.writerows(rows)
 
 lookup = {(row['variant'], row['case']): row for row in rows}
-lines = ['# Local benchmark observations', '',
+lines = ['# Linux benchmark observations', '',
          'Existing DataFusion SQL runner, release-nonlto, four Tokio threads, one input partition,',
          '2 GiB greedy memory pool. Each process runs seven iterations; the first is excluded.',
          'Two rounds use opposite revision order. Times below are medians of the remaining samples.',
-         'These are observations from this Windows laptop, without statistical significance claims.', '',
+         'These are observations from one GitHub-hosted Linux runner, without statistical significance claims.', '',
          '| Input | V1 bytes (ms) | V2 bytes (ms) | V2 elapsed / V1 | V1 groups | V2 groups |',
          '| --- | ---: | ---: | ---: | ---: | ---: |']
 for case in ['narrow', 'wide', 'rotating', 'booleans']:
