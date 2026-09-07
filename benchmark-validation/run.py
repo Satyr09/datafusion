@@ -73,7 +73,14 @@ def measure(variant, label, iterations):
     for file in sorted(files.glob('*.parquet')):
         parquet = pq.ParquetFile(file)
         meta = parquet.metadata
-        table = parquet.read().combine_chunks().replace_schema_metadata(None)
+        table = parquet.read()
+        # String views may reference different backing buffers for equal values.
+        # Normalize them before hashing so row-group layout cannot affect the hash.
+        schema = pa.schema([
+            pa.field(field.name, pa.string() if pa.types.is_string_view(field.type) else field.type, field.nullable)
+            for field in table.schema
+        ])
+        table = table.cast(schema).combine_chunks()
         assert meta.num_rows == 131072 and table.num_rows == 131072
         buffer = pa.BufferOutputStream()
         with pa.ipc.new_stream(buffer, table.schema) as writer:
