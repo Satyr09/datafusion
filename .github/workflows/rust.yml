@@ -39,6 +39,7 @@ concurrency:
 on:
   push:
     branches-ignore:
+      - 'daipayan/substrait-decimal-review'
       - 'gh-readonly-queue/**'
       - 'dependabot/**'
     paths-ignore:

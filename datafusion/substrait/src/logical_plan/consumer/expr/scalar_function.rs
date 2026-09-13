@@ -1090,7 +1090,7 @@ mod tests {
             );
             assert_eq!(
                 ScalarValue::try_from_array(batches[0].column(1), 0)?,
-                ScalarValue::Decimal128(Some(99_999_999), 38, 8)
+                ScalarValue::Decimal128(Some(99_999_999), 31, 8)
             );
         }
         Ok(())
