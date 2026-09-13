@@ -23,22 +23,27 @@
 //! arithmetic, without changing DataFusion's native SQL operators.
 //!
 //! Supports Decimal128 operands and outputs with nonnegative scales, including
-//! all standard Substrait decimal precisions (1 through 38). Values are rounded
-//! once to nearest, with ties away from zero, and checked against the output
-//! precision. NULL inputs propagate; overflow and zero divisors return errors.
+//! all standard Substrait decimal precisions (1 through 38). Division truncates
+//! toward zero, like native division. Reducing the scale of other operations
+//! rounds to nearest, with ties away from zero, like decimal casts. Results are
+//! checked against the output precision. NULL inputs propagate; overflow and
+//! zero divisors return errors.
 //! An explicit overflow option must allow ERROR. Other decimal representations
 //! and function options require separate implementations.
 
 use std::sync::Arc;
 
 use datafusion::arrow::array::Decimal128Array;
+use datafusion::arrow::compute::kernels::arity::{try_binary, try_unary};
 use datafusion::arrow::datatypes::i256;
 use datafusion::arrow::datatypes::validate_decimal_precision_and_scale;
 use datafusion::arrow::datatypes::{DataType, Decimal128Type, Field, FieldRef};
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::cast::as_primitive_array;
 use datafusion::common::{
     Result, ScalarValue, exec_datafusion_err, exec_err, substrait_err,
 };
+use datafusion::logical_expr::interval_arithmetic::Interval;
 use datafusion::logical_expr::{
     ColumnarValue, Operator, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl,
     Signature, Volatility,
@@ -52,9 +57,13 @@ pub(crate) struct DecimalArithmetic {
     function_signature: String,
     signature: Signature,
     op: Operator,
-    input_scales: [i8; 2],
     precision: u8,
     scale: i8,
+    left_multiplier: i256,
+    right_multiplier: i256,
+    result_multiplier: i256,
+    result_divisor: i256,
+    max: i256,
 }
 
 impl DecimalArithmetic {
@@ -103,13 +112,36 @@ impl DecimalArithmetic {
                 );
             }
         }
+        // Scale factors depend only on types. Compute them once when importing
+        // the call, rather than repeating wide powers of ten for every row.
+        let [s1, s2, output_scale] = [left_scale, right_scale, scale].map(i16::from);
+        let (left_shift, right_shift, result_shift) = match op {
+            Operator::Plus | Operator::Minus | Operator::Modulo => {
+                let common_scale = s1.max(s2);
+                (
+                    common_scale - s1,
+                    common_scale - s2,
+                    output_scale - common_scale,
+                )
+            }
+            Operator::Multiply => (0, 0, output_scale - s1 - s2),
+            Operator::Divide => {
+                let shift = output_scale + s2 - s1;
+                (shift.max(0), (-shift).max(0), 0)
+            }
+            _ => unreachable!("only decimal arithmetic operators are constructed"),
+        };
         Ok(Self {
             function_signature: function_signature.to_owned(),
             signature: Signature::exact(Vec::from(input_types), Volatility::Immutable),
             op,
-            input_scales: [left_scale, right_scale],
             precision,
             scale,
+            left_multiplier: power_of_ten(left_shift),
+            right_multiplier: power_of_ten(right_shift),
+            result_multiplier: power_of_ten(result_shift.max(0)),
+            result_divisor: power_of_ten((-result_shift).max(0)),
+            max: power_of_ten(i16::from(precision)) - i256::ONE,
         })
     }
 
@@ -127,48 +159,38 @@ impl DecimalArithmetic {
         }
         let left = i256::from_i128(left);
         let right = i256::from_i128(right);
-        let [s1, s2] = self.input_scales.map(i16::from);
-        let output_scale = i16::from(self.scale);
         // Each input has at most 38 digits. Exact products and operands aligned
         // to max(s1, s2) fit in i256; rescale only after the operation so neither
         // cancellation nor fractional carries are lost.
-        let result = match self.op {
-            Operator::Plus | Operator::Minus | Operator::Modulo => {
-                let scale = s1.max(s2);
-                left.checked_mul(power_of_ten(scale - s1)).and_then(|l| {
-                    let r = right.checked_mul(power_of_ten(scale - s2))?;
-                    let value = match self.op {
-                        Operator::Plus => l.checked_add(r),
-                        Operator::Minus => l.checked_sub(r),
-                        _ => l.checked_rem(r),
-                    }?;
-                    rescale(value, scale, output_scale)
-                })
-            }
-            Operator::Multiply => left
-                .checked_mul(right)
-                .and_then(|value| rescale(value, s1 + s2, output_scale)),
-            Operator::Divide => {
-                // Work directly at the output scale. In particular, do not use
-                // Arrow's s1 + 4 intermediate scale for high-scale operands.
-                let exponent = output_scale + s2 - s1;
-                if exponent >= 0 {
-                    left.checked_mul(power_of_ten(exponent))
-                        .and_then(|numerator| rounded_div(numerator, right))
-                } else {
-                    right
-                        .checked_mul(power_of_ten(-exponent))
-                        .and_then(|denominator| rounded_div(left, denominator))
+        // For division the factors calculate directly at the output scale.
+        // If scaling the numerator overflows i256, dividing by a <=38-digit
+        // denominator cannot yield a <=38-digit result either.
+        let result = multiply(left, self.left_multiplier)
+            .and_then(|left| {
+                let right = multiply(right, self.right_multiplier)?;
+                match self.op {
+                    Operator::Plus => left.checked_add(right),
+                    Operator::Minus => left.checked_sub(right),
+                    Operator::Multiply => left.checked_mul(right),
+                    // Keep division's rounding independent of overflow options
+                    // and precision-only changes to the declared result type.
+                    Operator::Divide => left.checked_div(right),
+                    Operator::Modulo => left.checked_rem(right),
+                    _ => {
+                        unreachable!("only decimal arithmetic operators are constructed")
+                    }
                 }
-                // If scaling the numerator overflows i256, dividing by a
-                // <=38-digit denominator cannot yield a <=38-digit result.
-                // Thus this failure cannot reject a representable output.
-            }
-            _ => unreachable!("only decimal arithmetic operators are constructed"),
-        };
-        let max = power_of_ten(i16::from(self.precision)) - i256::ONE;
+            })
+            .and_then(|value| multiply(value, self.result_multiplier))
+            .and_then(|value| {
+                if self.result_divisor == i256::ONE {
+                    Some(value)
+                } else {
+                    rounded_div(value, self.result_divisor)
+                }
+            });
         result
-            .filter(|v| *v >= -max && *v <= max)
+            .filter(|v| *v >= -self.max && *v <= self.max)
             .and_then(i256::to_i128)
             .ok_or_else(|| {
                 exec_datafusion_err!(
@@ -185,11 +207,11 @@ fn power_of_ten(exponent: i16) -> i256 {
     i256::from_i128(10).wrapping_pow(exponent as u32)
 }
 
-fn rescale(value: i256, from: i16, to: i16) -> Option<i256> {
-    if to >= from {
-        value.checked_mul(power_of_ten(to - from))
+fn multiply(value: i256, factor: i256) -> Option<i256> {
+    if factor == i256::ONE {
+        Some(value)
     } else {
-        rounded_div(value, power_of_ten(from - to))
+        value.checked_mul(factor)
     }
 }
 
@@ -240,37 +262,78 @@ impl ScalarUDFImpl for DecimalArithmetic {
         true
     }
 
+    fn evaluate_bounds(&self, _inputs: &[&Interval]) -> Result<Interval> {
+        // Keep the decimal type when a parent expression asks for a range.
+        // Tighter bounds would also need to account for rounding and overflow.
+        Interval::make_unbounded(&self.output_type())
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let scalar = args
-            .args
-            .iter()
-            .all(|a| matches!(a, ColumnarValue::Scalar(_)));
-        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
-        let left = as_primitive_array::<Decimal128Type>(&arrays[0])?;
-        let right = as_primitive_array::<Decimal128Type>(&arrays[1])?;
-        let values = left
-            .iter()
-            .zip(right.iter())
-            .map(|(left, right)| match (left, right) {
-                (Some(left), Some(right)) => self.evaluate_value(left, right).map(Some),
-                _ => Ok(None),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let result = Decimal128Array::from(values)
-            .with_precision_and_scale(self.precision, self.scale)?;
-        if scalar {
-            Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
-                &result, 0,
-            )?))
-        } else {
-            Ok(ColumnarValue::Array(Arc::new(result)))
-        }
+        let evaluate = |left, right| {
+            self.evaluate_value(left, right)
+                .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+        };
+        // Scalar operands stay scalar: common expressions such as price * 0.9
+        // should not allocate a repeated column for the constant.
+        let result: Decimal128Array = match (&args.args[0], &args.args[1]) {
+            (
+                ColumnarValue::Scalar(ScalarValue::Decimal128(left, _, _)),
+                ColumnarValue::Scalar(ScalarValue::Decimal128(right, _, _)),
+            ) => {
+                let value = match (left, right) {
+                    (Some(left), Some(right)) => {
+                        Some(self.evaluate_value(*left, *right)?)
+                    }
+                    _ => None,
+                };
+                return Ok(ColumnarValue::Scalar(ScalarValue::Decimal128(
+                    value,
+                    self.precision,
+                    self.scale,
+                )));
+            }
+            (ColumnarValue::Array(left), ColumnarValue::Array(right)) => try_binary(
+                as_primitive_array::<Decimal128Type>(left)?,
+                as_primitive_array::<Decimal128Type>(right)?,
+                evaluate,
+            )?,
+            (
+                ColumnarValue::Array(array),
+                ColumnarValue::Scalar(ScalarValue::Decimal128(value, _, _)),
+            ) => {
+                let array = as_primitive_array::<Decimal128Type>(array)?;
+                match value {
+                    Some(value) => try_unary(array, |left| evaluate(left, *value))?,
+                    None => Decimal128Array::new_null(array.len()),
+                }
+            }
+            (
+                ColumnarValue::Scalar(ScalarValue::Decimal128(value, _, _)),
+                ColumnarValue::Array(array),
+            ) => {
+                let array = as_primitive_array::<Decimal128Type>(array)?;
+                match value {
+                    Some(value) => try_unary(array, |right| evaluate(*value, right))?,
+                    None => Decimal128Array::new_null(array.len()),
+                }
+            }
+            _ => {
+                return exec_err!(
+                    "Expected two Decimal128 arguments for {}",
+                    self.name()
+                );
+            }
+        };
+        Ok(ColumnarValue::Array(Arc::new(
+            result.with_precision_and_scale(self.precision, self.scale)?,
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bigdecimal::{BigDecimal, RoundingMode};
 
     fn function(op: Operator, scales: [i8; 2], output: (u8, i8)) -> DecimalArithmetic {
         DecimalArithmetic::try_new(
@@ -286,19 +349,18 @@ mod tests {
     #[test]
     fn decimal_values_at_declared_scale() -> Result<()> {
         use Operator::*;
-        // Raw integers encode value * 10^scale. Expected answers are rounded
-        // mathematical results, not results obtained from Arrow's kernels.
+        // Raw integers encode value * 10^scale. Division truncates; scale
+        // reduction after the other operations rounds the exact result.
         for (op, scales, output, left, right, expected) in [
             (Divide, [2, 1], (21, 8), 100, 30, 33_333_333),
-            (Divide, [2, 1], (21, 8), 200, 30, 66_666_667),
-            (Divide, [2, 1], (21, 8), -200, 30, -66_666_667),
-            (Divide, [2, 1], (21, 8), 200, -30, -66_666_667),
-            (Divide, [2, 1], (21, 8), -200, -30, 66_666_667),
-            (Divide, [0, 0], (3, 0), 5, 2, 3),
-            (Divide, [0, 0], (3, 0), -5, 2, -3),
+            (Divide, [2, 1], (21, 8), 200, 30, 66_666_666),
+            (Divide, [2, 1], (21, 8), -200, 30, -66_666_666),
+            (Divide, [2, 1], (21, 8), 200, -30, -66_666_666),
+            (Divide, [2, 1], (21, 8), -200, -30, 66_666_666),
+            (Divide, [0, 0], (3, 0), 5, 2, 2),
+            (Divide, [0, 0], (3, 0), -5, 2, -2),
             (Divide, [0, 0], (3, 0), 4, 3, 1),
-            // The half threshold must work for odd denominators too.
-            (Divide, [0, 0], (3, 0), 5, 3, 2),
+            (Divide, [0, 0], (3, 0), 5, 3, 1),
             (Plus, [2, 2], (3, 1), 4, 4, 1),
             (Plus, [2, 2], (3, 1), -4, -4, -1),
             (Minus, [2, 2], (3, 1), 104, 96, 1),
@@ -367,9 +429,11 @@ mod tests {
     fn decimal_overflow_and_zero_divisors() {
         for (op, scales, output, left, right) in [
             (Operator::Plus, [0, 0], (2, 0), 99, 1),
-            // Rounding can itself make the result overflow.
-            (Operator::Divide, [0, 0], (2, 0), 199, 2),
-            (Operator::Divide, [0, 0], (2, 0), -199, 2),
+            (Operator::Divide, [0, 0], (2, 0), 200, 2),
+            (Operator::Divide, [0, 0], (2, 0), -200, 2),
+            // Rounding after addition can itself make the result overflow.
+            (Operator::Plus, [1, 1], (2, 0), 994, 1),
+            (Operator::Plus, [1, 1], (2, 0), -994, -1),
             (
                 Operator::Multiply,
                 [10, 10],
@@ -416,5 +480,63 @@ mod tests {
             );
             assert_eq!(result.is_ok(), supported, "{result:?}");
         }
+    }
+
+    #[test]
+    fn decimal_matches_arbitrary_precision_arithmetic() -> Result<()> {
+        // Use a separate decimal implementation to check values and overflow
+        // across the supported scales, including intermediates wider than i128.
+        let mut seed = 42_u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed
+        };
+        for _ in 0..3000 {
+            let scales = [(next() % 39) as i8, (next() % 39) as i8];
+            let precision = (next() % 38 + 1) as u8;
+            let scale = (next() % (u64::from(precision) + 1)) as i8;
+            let left = i128::from(next() as i64) * 10_i128.pow((next() % 19) as u32);
+            let right = i128::from(next() as i64) * 10_i128.pow((next() % 19) as u32);
+            let l = BigDecimal::new(left.into(), i64::from(scales[0]));
+            let r = BigDecimal::new(right.into(), i64::from(scales[1]));
+            for op in [
+                Operator::Plus,
+                Operator::Minus,
+                Operator::Multiply,
+                Operator::Divide,
+                Operator::Modulo,
+            ] {
+                let (exact, rounding) = match op {
+                    Operator::Plus => (&l + &r, RoundingMode::HalfUp),
+                    Operator::Minus => (&l - &r, RoundingMode::HalfUp),
+                    Operator::Multiply => (&l * &r, RoundingMode::HalfUp),
+                    Operator::Divide => (&l / &r, RoundingMode::Down),
+                    Operator::Modulo => (&l % &r, RoundingMode::HalfUp),
+                    _ => unreachable!(),
+                };
+                let (unscaled, _) = exact
+                    .with_scale_round(i64::from(scale), rounding)
+                    .as_bigint_and_exponent();
+                let digits = unscaled.to_string();
+                let expected =
+                    if digits.trim_start_matches('-').len() > usize::from(precision) {
+                        None
+                    } else {
+                        Some(digits.parse::<i128>().unwrap())
+                    };
+                let result =
+                    function(op, scales, (precision, scale)).evaluate_value(left, right);
+                match expected {
+                    Some(expected) => assert_eq!(
+                        result?, expected,
+                        "{left} {op} {right}, scales {scales:?}, output ({precision},{scale})"
+                    ),
+                    None => assert!(
+                        result.unwrap_err().to_string().contains("Decimal overflow")
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 }

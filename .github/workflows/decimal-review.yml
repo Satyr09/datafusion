@@ -1,0 +1,167 @@
+name: Decimal review
+
+on:
+  push:
+    branches: [daipayan/substrait-decimal-review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decimal-review-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 4
+  RUST_BACKTRACE: 1
+
+jobs:
+  checks:
+    name: ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [full-feature-clippy, extended-tests]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler cmake ninja-build
+          rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: decimal-review-${{ matrix.check }}
+          cache-on-failure: true
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Full feature Clippy
+        if: matrix.check == 'full-feature-clippy'
+        run: cargo clippy --locked --profile ci --all-targets --all-features -- -D warnings
+      - name: Extended workspace tests
+        if: matrix.check == 'extended-tests'
+        run: |
+          cargo test --locked --profile ci \
+            --exclude datafusion-examples --exclude datafusion-benchmarks --exclude datafusion-cli \
+            --workspace --lib --tests --bins \
+            --features avro,json,backtrace,extended_tests,recursive_protection,parquet_encryption
+      - name: Check source tree
+        run: git diff --exit-code
+
+  performance:
+    name: Compare decimal performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MAIN_SHA: 15f32dd7ac751952fffc53906144dfa67c5e868f
+      PREVIOUS_SHA: 555b760d429d9753ef3a13f2cff8fd9c2c0f441d
+      CARGO_TARGET_DIR: /home/runner/work/_temp/decimal-target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler cmake
+          rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: decimal-review-performance
+          workspaces: '. -> /home/runner/work/_temp/decimal-target'
+          cache-on-failure: true
+      - name: Compare main, the previous PR, and this revision
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/decimal-results"
+          cp datafusion/substrait/benches/decimal_arithmetic.rs "$RUNNER_TEMP/decimal-benchmark.rs"
+          cp datafusion/substrait/src/logical_plan/consumer/expr/scalar_function.rs "$RUNNER_TEMP/decimal-consumer-tests.rs"
+          git fetch https://github.com/apache/datafusion.git "$MAIN_SHA"
+          lscpu > "$RUNNER_TEMP/decimal-results/machine.txt"
+          rustc -Vv >> "$RUNNER_TEMP/decimal-results/machine.txt"
+          for version in main previous revised; do
+            case "$version" in
+              main) ref="$MAIN_SHA" ;;
+              previous) ref="$PREVIOUS_SHA" ;;
+              revised) ref="$CANDIDATE_SHA" ;;
+            esac
+            git checkout --force --detach "$ref"
+            mkdir -p datafusion/substrait/benches
+            cp "$RUNNER_TEMP/decimal-benchmark.rs" datafusion/substrait/benches/decimal_arithmetic.rs
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path('datafusion/substrait/Cargo.toml')
+          text = p.read_text()
+          if 'criterion = ' not in text:
+              text = text.replace('[dev-dependencies]', '[dev-dependencies]\ncriterion = { workspace = true }\nbigdecimal = { workspace = true }')
+          if 'name = "decimal_arithmetic"' not in text:
+              text += '\n[[bench]]\nname = "decimal_arithmetic"\nharness = false\n'
+          p.write_text(text)
+          PY
+            printf '%s %s\n' "$version" "$ref" >> "$RUNNER_TEMP/decimal-results/revisions.txt"
+            cargo bench --profile release-nonlto -p datafusion-substrait --bench decimal_arithmetic --no-run --message-format=json \
+              > "$RUNNER_TEMP/decimal-build.json"
+            executable=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "decimal_arithmetic" and .executable != null) | .executable' "$RUNNER_TEMP/decimal-build.json" | tail -1)
+            test -n "$executable"
+            cp "$executable" "$RUNNER_TEMP/decimal-$version"
+            "$RUNNER_TEMP/decimal-$version" --bench --save-baseline "$version" \
+              2>&1 | tee "$RUNNER_TEMP/decimal-results/$version.log"
+          done
+          # Repeat in reverse order to help expose runner noise and order effects.
+          for version in revised previous main; do
+            "$RUNNER_TEMP/decimal-$version" --bench --save-baseline "$version-repeat" \
+              2>&1 | tee "$RUNNER_TEMP/decimal-results/$version-repeat.log"
+          done
+      - name: Summarize timings
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['CARGO_TARGET_DIR']) / 'criterion'
+          rows = []
+          for result in root.rglob('revised/estimates.json'):
+              case = result.parent.parent
+              means = {}
+              for version in ['main', 'previous', 'revised', 'main-repeat', 'previous-repeat', 'revised-repeat']:
+                  path = case / version / 'estimates.json'
+                  if path.exists():
+                      means[version] = json.loads(path.read_text())['mean']['point_estimate']
+              rows.append((str(case.relative_to(root)), means))
+          output = Path(os.environ['RUNNER_TEMP']) / 'decimal-results'
+          output.mkdir(exist_ok=True)
+          (output / 'timings.json').write_text(json.dumps(rows, indent=2))
+          lines = ['Decimal benchmark means in microseconds.', '',
+                   'Matching cases preserve the calculation. Mismatched cases on main use different precision/scale; those timings are not equivalent work.', '',
+                   '| Case | Main | Previous PR | Revised | Revised repeat |',
+                   '|---|---:|---:|---:|---:|']
+          for case, means in sorted(rows):
+              values = [f'{means[v]/1000:.3f}' if v in means else '-' for v in ['main','previous','revised','revised-repeat']]
+              lines.append('| ' + case + ' | ' + ' | '.join(values) + ' |')
+          report = '\n'.join(lines) + '\n'
+          (output / 'report.md').write_text(report)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(report)
+          PY
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: decimal-performance
+          path: |
+            ${{ runner.temp }}/decimal-results
+            ${{ runner.temp }}/decimal-target/criterion
+          retention-days: 14
