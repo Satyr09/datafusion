@@ -1109,6 +1109,11 @@ mod tests {
             DataType::Decimal128(5, 1),
             Some(DataType::Decimal128(21, 8)),
         )?;
+        if let Some(super::Kind::Decimal(decimal)) =
+            &mut call.output_type.as_mut().unwrap().kind
+        {
+            decimal.nullability = substrait::proto::r#type::Nullability::Nullable as i32;
+        }
         let schema = DFSchema::try_from(Schema::new(vec![
             Field::new("a", DataType::Decimal128(10, 2), true),
             Field::new("b", DataType::Decimal128(5, 1), true),

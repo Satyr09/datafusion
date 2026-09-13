@@ -29,7 +29,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::functions_aggregate::expr_fn::sum;
-use datafusion::logical_expr::{Expr, col, lit};
+use datafusion::logical_expr::{Expr, ExprSchemable, col, lit};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -80,7 +80,10 @@ fn run(c: &mut Criterion) -> Result<()> {
         ("wide_add", "add", (38, 10), (38, 10), (38, 9)),
         ("wide_multiply", "multiply", (38, 10), (38, 10), (38, 6)),
     ] {
-        for shape in ["columns", "constant", "nulls"] {
+        for shape in ["columns", "constant", "nulls", "large"] {
+            if shape == "large" && !name.starts_with("wide_") {
+                continue;
+            }
             let mut extensions = Extensions::default();
             extensions
                 .functions
@@ -94,7 +97,11 @@ fn run(c: &mut Criterion) -> Result<()> {
                 Field::new("b", right_dt, false),
             ]));
             let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
-            let right = 3 * 10_i128.pow(right_type.1 as u32);
+            let right = match (shape, function_name) {
+                ("large", "add") => 9 * 10_i128.pow(37),
+                ("large", "multiply") => 10_i128.pow(10),
+                _ => 3 * 10_i128.pow(right_type.1 as u32),
+            };
             let call = ScalarFunction {
                 function_reference: 0,
                 arguments: vec![
@@ -124,10 +131,21 @@ fn run(c: &mut Criterion) -> Result<()> {
             };
             let expression =
                 runtime.block_on(consumer.consume_scalar_function(&call, &df_schema))?;
+            // These values require wider intermediates before scale reduction.
+            // Main does not implement that calculation, so compare only revisions
+            // that preserve the declared type for these two cases.
+            if shape == "large"
+                && expression.get_type(&df_schema)?
+                    != DataType::Decimal128(output_type.0, output_type.1)
+            {
+                continue;
+            }
             let physical = state.create_physical_expr(expression, &df_schema)?;
             let left_values = (0..ROWS).map(|i| {
                 if shape == "nulls" && i % 5 == 0 {
                     None
+                } else if shape == "large" {
+                    Some(9 * 10_i128.pow(37) - i as i128)
                 } else {
                     Some((1 + (i % 100) as i128) * 10_i128.pow(left_type.1 as u32))
                 }

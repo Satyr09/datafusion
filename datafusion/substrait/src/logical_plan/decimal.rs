@@ -19,8 +19,9 @@
 //!
 //! Arrow's native decimal kernels derive their own result types. Casting their
 //! output cannot recover discarded digits or avoid an intermediate overflow.
-//! This function instead computes at the declared scale using checked i256
-//! arithmetic, without changing DataFusion's native SQL operators.
+//! This function computes at the declared scale using checked integer arithmetic,
+//! with i256 intermediates when needed. DataFusion's native SQL operators are
+//! unchanged.
 //!
 //! Supports Decimal128 operands and outputs with nonnegative scales, including
 //! all standard Substrait decimal precisions (1 through 38). Division truncates
@@ -63,7 +64,8 @@ pub(crate) struct DecimalArithmetic {
     right_multiplier: i256,
     result_multiplier: i256,
     result_divisor: i256,
-    max: i256,
+    max: i128,
+    narrow: Option<DecimalArithmetic128>,
 }
 
 impl DecimalArithmetic {
@@ -131,17 +133,24 @@ impl DecimalArithmetic {
             }
             _ => unreachable!("only decimal arithmetic operators are constructed"),
         };
+        let factors = [
+            power_of_ten(left_shift),
+            power_of_ten(right_shift),
+            power_of_ten(result_shift.max(0)),
+            power_of_ten((-result_shift).max(0)),
+        ];
         Ok(Self {
             function_signature: function_signature.to_owned(),
             signature: Signature::exact(Vec::from(input_types), Volatility::Immutable),
             op,
             precision,
             scale,
-            left_multiplier: power_of_ten(left_shift),
-            right_multiplier: power_of_ten(right_shift),
-            result_multiplier: power_of_ten(result_shift.max(0)),
-            result_divisor: power_of_ten((-result_shift).max(0)),
-            max: power_of_ten(i16::from(precision)) - i256::ONE,
+            left_multiplier: factors[0],
+            right_multiplier: factors[1],
+            result_multiplier: factors[2],
+            result_divisor: factors[3],
+            max: 10_i128.pow(u32::from(precision)) - 1,
+            narrow: DecimalArithmetic128::new(factors),
         })
     }
 
@@ -156,6 +165,14 @@ impl DecimalArithmetic {
     fn evaluate_value(&self, left: i128, right: i128) -> Result<i128> {
         if matches!(self.op, Operator::Divide | Operator::Modulo) && right == 0 {
             return exec_err!("Divide by zero in Substrait {}", self.name());
+        }
+        // Precision describes a column's capacity, not the size of every value.
+        // Most values fit in i128 even in decimal(38, s) columns. Retry in i256
+        // if any intermediate overflows; never narrow or round the inputs.
+        if let Some(narrow) = &self.narrow
+            && let Some(value) = narrow.evaluate(self.op, left, right)
+        {
+            return self.check_result(Some(value));
         }
         let left = i256::from_i128(left);
         let right = i256::from_i128(right);
@@ -189,9 +206,12 @@ impl DecimalArithmetic {
                     rounded_div(value, self.result_divisor)
                 }
             });
+        self.check_result(result.and_then(i256::to_i128))
+    }
+
+    fn check_result(&self, result: Option<i128>) -> Result<i128> {
         result
             .filter(|v| *v >= -self.max && *v <= self.max)
-            .and_then(i256::to_i128)
             .ok_or_else(|| {
                 exec_datafusion_err!(
                     "Decimal overflow in Substrait {}: result does not fit {:?}",
@@ -199,6 +219,53 @@ impl DecimalArithmetic {
                     self.output_type()
                 )
             })
+    }
+}
+
+/// The common case uses native integers. `None` means the exact intermediate
+/// needs wider arithmetic, including when it would fit after scale reduction.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct DecimalArithmetic128 {
+    left_multiplier: i128,
+    right_multiplier: i128,
+    result_multiplier: i128,
+    result_divisor: i128,
+}
+
+impl DecimalArithmetic128 {
+    fn new(factors: [i256; 4]) -> Option<Self> {
+        Some(Self {
+            left_multiplier: factors[0].to_i128()?,
+            right_multiplier: factors[1].to_i128()?,
+            result_multiplier: factors[2].to_i128()?,
+            result_divisor: factors[3].to_i128()?,
+        })
+    }
+
+    fn evaluate(&self, op: Operator, left: i128, right: i128) -> Option<i128> {
+        let left = left.checked_mul(self.left_multiplier)?;
+        let right = right.checked_mul(self.right_multiplier)?;
+        let value = match op {
+            Operator::Plus => left.checked_add(right),
+            Operator::Minus => left.checked_sub(right),
+            Operator::Multiply => left.checked_mul(right),
+            Operator::Divide => left.checked_div(right),
+            Operator::Modulo => left.checked_rem(right),
+            _ => unreachable!("only decimal arithmetic operators are constructed"),
+        }?
+        .checked_mul(self.result_multiplier)?;
+        if self.result_divisor == 1 {
+            return Some(value);
+        }
+        // The divisor is a positive power of ten, at least 10, so neither
+        // division by zero nor MIN / -1 is possible here.
+        let quotient = value / self.result_divisor;
+        let remainder = value % self.result_divisor;
+        if remainder.unsigned_abs() >= (self.result_divisor / 2) as u128 {
+            quotient.checked_add(value.signum())
+        } else {
+            Some(quotient)
+        }
     }
 }
 
