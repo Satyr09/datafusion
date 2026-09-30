@@ -117,13 +117,27 @@ jobs:
           shared-key: parallel-parquet-review-tests
           cache-on-failure: true
           cache-workspace-crates: true
+      - name: Apply storage-failure test candidate
+        run: cp control/benchmark-validation/test-fixtures/write_errors.rs engine/datafusion/core/tests/parquet/write_errors.rs
       - name: Check formatting
         working-directory: engine
         run: cargo fmt --all --check
       - name: Test revised writer and verify regressions against earlier stages
         run: python3 control/benchmark-validation/check_regressions.py engine regression-results
-      - name: Check changed packages and reproduce the existing SQL lint
-        run: python3 control/benchmark-validation/check_review_lints.py engine regression-results
+      - name: Clippy for changed packages with all targets and features
+        working-directory: engine
+        run: |
+          cargo clippy --locked --all-targets --all-features \
+            -p datafusion -p datafusion-common -p datafusion-datasource-parquet \
+            -- -D warnings 2>&1 | tee ../regression-results/changed-packages-all-features.log
+      - name: Extended workspace tests
+        working-directory: engine
+        run: |
+          cargo test --locked --profile ci \
+            --exclude datafusion-examples --exclude datafusion-benchmarks --exclude datafusion-cli \
+            --workspace --lib --tests --bins \
+            --features avro,json,backtrace,extended_tests,recursive_protection,parquet_encryption \
+            2>&1 | tee ../regression-results/extended-workspace.log
       - name: Preserve regression logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

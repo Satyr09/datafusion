@@ -57,13 +57,13 @@ subprocess.run(['git', 'fetch', '--no-recurse-submodules', '--no-tags', '--depth
 try:
     test('revised', 'parquet::write_')
     sink.write_bytes(subprocess.check_output(['git', 'show', f'{stages["base"]}:datafusion/datasource-parquet/src/sink.rs'], cwd=engine))
-    test('base_error_regression', 'parquet::write_errors',
+    test('base_error_regression', 'parallel_write_returns_column_error_before_input_ends',
          'the writer kept consuming input after a column failed')
     test('base_byte_regression', 'parquet::write_row_groups',
          'the byte target must split each input batch')
     for name in ['error_fix', 'refactor']:
         sink.write_bytes(subprocess.check_output(['git', 'show', f'{stages[name]}:datafusion/datasource-parquet/src/sink.rs'], cwd=engine))
-        test(name, 'parquet::write_errors')
+        test(name, 'parallel_write_returns_column_error_before_input_ends')
 finally:
     sink.write_bytes(original)
 
