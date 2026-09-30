@@ -1,0 +1,8 @@
+description = "Local comparison of parallel Parquet row-group byte policies"
+query_pattern = "q{QUERY_ID_PADDED}.benchmark"
+
+[[options]]
+name = "output-dir"
+env = "WRITE_OUTPUT_DIR"
+default = "../../review-notes/sql-write-output"
+help = "Directory for the single-file COPY outputs."

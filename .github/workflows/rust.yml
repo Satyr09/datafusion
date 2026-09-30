@@ -39,6 +39,7 @@ concurrency:
 on:
   push:
     branches-ignore:
+      - daipayan/parallel-max-row-group-bytes-review-validation
       - 'gh-readonly-queue/**'
       - 'dependabot/**'
     paths-ignore:
