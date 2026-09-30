@@ -22,9 +22,14 @@ on:
     branches:
       - daipayan/parallel-max-row-group-bytes-review-validation
   workflow_dispatch:
+    inputs:
+      run_benchmarks:
+        description: Run the existing SQL benchmark comparison as well
+        type: boolean
+        default: false
 
 concurrency:
-  group: parallel-parquet-review
+  group: parallel-parquet-review-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -32,6 +37,7 @@ permissions:
 
 jobs:
   comparison:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_benchmarks }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -97,7 +103,7 @@ jobs:
           path: control
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 782cb30e9212e24be816b9f155bf3fae4fa672ee
+          ref: c23df9f990e5c8a04625d119fedaa196ff890c0b
           path: engine
           submodules: true
       - name: Install build dependencies

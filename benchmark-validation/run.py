@@ -35,7 +35,7 @@ reports.mkdir(parents=True, exist_ok=True)
 variants = {
     'base': '5bf6aef8e37c91d882c0f75b772201d62733c88f',
     'reviewed': '28c48da5484e0d4a5cf6c4637ee7ebdda390fd8c',
-    'revised': '782cb30e9212e24be816b9f155bf3fae4fa672ee',
+    'revised': 'c23df9f990e5c8a04625d119fedaa196ff890c0b',
 }
 
 def run(command, log, cwd=engine):

@@ -26,8 +26,8 @@ sink = engine / 'datafusion/datasource-parquet/src/sink.rs'
 original = sink.read_bytes()
 stages = {
     'base': '5bf6aef8e37c91d882c0f75b772201d62733c88f',
-    'error_fix': 'b057ef83b28ca0a1dc63ed52dd53d19bab688a3c',
-    'refactor': '2ede581759b8d30137f9d8d958078acab707dcb9',
+    'error_fix': '450c5d779f3961f4823f616312d5f5e312c6110a',
+    'refactor': '70904d01faa76d8f193ac79ea037fc0c41124420',
 }
 command = ['cargo', 'test', '--locked', '--profile', 'ci', '-p', 'datafusion',
            '--test', 'parquet_integration', '--features', 'parquet_encryption']
