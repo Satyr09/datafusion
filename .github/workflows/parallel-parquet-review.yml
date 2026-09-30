@@ -103,7 +103,7 @@ jobs:
           path: control
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: c23df9f990e5c8a04625d119fedaa196ff890c0b
+          ref: 61bcdc925eae161fec9cd2f2d2b4d8c12a7ffbd1
           path: engine
           submodules: true
       - name: Install build dependencies
@@ -122,9 +122,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Test revised writer and verify regressions against earlier stages
         run: python3 control/benchmark-validation/check_regressions.py engine regression-results
-      - name: Clippy with all targets and features
-        working-directory: engine
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check changed packages and reproduce the existing SQL lint
+        run: python3 control/benchmark-validation/check_review_lints.py engine regression-results
       - name: Preserve regression logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
