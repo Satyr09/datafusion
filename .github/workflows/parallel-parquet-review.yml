@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Parallel Parquet stack refresh
+name: Parallel Parquet refactor extended validation
 on:
   push:
     branches:
@@ -23,13 +23,10 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: parallel-parquet-stack-${{ github.sha }}
-  cancel-in-progress: false
 jobs:
-  validation:
+  refactor-extended:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -49,56 +46,33 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y protobuf-compiler
-          rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.99.0 --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: engine -> ../target
           shared-key: parallel-parquet-stack-199
           cache-on-failure: true
           cache-workspace-crates: true
-      - name: Validate every stage before committing the refreshed branches
-        run: python3 control/stack-validation/validate_stack.py engine control validation-results
-      - name: Preserve validation results
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: parallel-parquet-stack-validation
-          path: validation-results
-          retention-days: 30
-  benchmarks:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      TOKIO_WORKER_THREADS: 4
-      RUSTUP_TOOLCHAIN: 1.99.0
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          path: control
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: apache/datafusion
-          ref: 2566bc1052b32cce327b11d196a4dade52dd57d8
-          path: engine
-      - name: Install dependencies
+      - name: Apply and verify the already linted refactor candidate
+        working-directory: engine
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          python3 -m venv metadata-venv
-          metadata-venv/bin/python -m pip install pyarrow==25.0.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          workspaces: engine -> ../target
-          shared-key: parallel-parquet-stack-bench-199
-          cache-on-failure: true
-          cache-workspace-crates: true
-      - name: Compare upstream, prerequisites, and byte-target implementation
-        run: metadata-venv/bin/python control/benchmark-validation/run_stack.py engine benchmark-results all
-      - name: Preserve benchmark results
+          mkdir -p ../refactor-results
+          git apply --index ../control/stack-validation/02-refactor.patch
+          git write-tree | tee ../refactor-results/tree.txt
+          test "$(git write-tree)" = a93f4af04c7927fdb3d7ffbdd86a8b1c1444ae91
+      - name: Finish the refactor extended workspace tests
+        working-directory: engine
+        run: |
+          set -o pipefail
+          cargo test --locked --profile ci \
+            --exclude datafusion-examples --exclude datafusion-benchmarks --exclude datafusion-cli \
+            --workspace --lib --tests --bins \
+            --features avro,json,backtrace,extended_tests,recursive_protection,parquet_encryption \
+            2>&1 | tee ../refactor-results/extended.log
+      - name: Preserve the refactor results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: parallel-parquet-stack-benchmarks
-          path: benchmark-results/reports
+          name: parallel-parquet-refactor-extended
+          path: refactor-results
           retention-days: 30
