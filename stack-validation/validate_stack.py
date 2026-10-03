@@ -44,7 +44,7 @@ def run(label, args, expected=None):
 extended = ['cargo', 'test', '--locked', '--profile', 'ci', '--exclude', 'datafusion-examples', '--exclude', 'datafusion-benchmarks', '--exclude', 'datafusion-cli', '--workspace', '--lib', '--tests', '--bins', '--features', 'avro,json,backtrace,extended_tests,recursive_protection,parquet_encryption']
 focused = ['cargo', 'test', '--locked', '--profile', 'ci', '-p', 'datafusion', '--test', 'parquet_integration', '--features', 'parquet_encryption']
 sink = engine / 'datafusion/datasource-parquet/src/sink.rs'
-for stage in ['01-error-fix', '02-refactor', '03-feature']:
+for stage in ['03-feature', '01-error-fix', '02-refactor']:
     run(f'{stage}-reset', ['git', 'reset', '--hard', base])
     run(f'{stage}-apply', ['git', 'apply', '--index', str(control / 'stack-validation' / f'{stage}.patch')])
     tree = subprocess.check_output(['git', 'write-tree'], cwd=engine, text=True).strip()
@@ -62,6 +62,12 @@ for stage in ['01-error-fix', '02-refactor', '03-feature']:
         finally:
             sink.write_bytes(fixed)
     if stage == '03-feature':
+        updated = sink.read_bytes()
+        sink.write_bytes((control / 'stack-validation/arrow59-boundary-sink.rs').read_bytes())
+        try:
+            run('arrow59-boundary-ablation', [*focused, 'growing_strings', '--', '--nocapture'], 'serial and parallel layouts differ')
+        finally:
+            sink.write_bytes(updated)
         run('feature-docs-format', ['bash', './ci/scripts/doc_prettier_check.sh', '--write', '--allow-dirty'])
         with (output / 'feature-docs-formatting.patch').open('wb') as patch:
             subprocess.run(['git', 'diff', '--binary'], cwd=engine, stdout=patch, check=True)

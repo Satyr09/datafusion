@@ -303,10 +303,10 @@ index 00000000..66329dbb
 +}
 diff --git a/datafusion/core/tests/parquet/write_row_groups.rs b/datafusion/core/tests/parquet/write_row_groups.rs
 new file mode 100644
-index 00000000..5c2158f3
+index 00000000..953231ec
 --- /dev/null
 +++ b/datafusion/core/tests/parquet/write_row_groups.rs
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,165 @@
 +// Licensed to the Apache Software Foundation (ASF) under one
 +// or more contributor license agreements.  See the NOTICE file
 +// distributed with this work for additional information
@@ -341,16 +341,18 @@ index 00000000..5c2158f3
 +use tempfile::TempDir;
 +
 +#[rstest]
-+#[case(10_000, None)]
-+#[case(128, None)]
-+#[case(10_000, Some(1))]
-+#[case(300, Some(1))]
-+#[case(10_000, Some(4096))]
-+#[case(300, Some(4096))]
++#[case(10_000, None, false)]
++#[case(128, None, false)]
++#[case(10_000, Some(1), false)]
++#[case(300, Some(1), false)]
++#[case(10_000, Some(4096), false)]
++#[case(300, Some(4096), false)]
++#[case::growing_strings(200, Some(12_288), true)]
 +#[tokio::test]
 +async fn parallel_copy_matches_serial_row_groups(
 +    #[case] max_rows: usize,
 +    #[case] max_bytes: Option<usize>,
++    #[case] growing_strings: bool,
 +) -> Result<()> {
 +    // Each partition becomes a separate file. List lengths differ from root row
 +    // counts, and string widths change between batches to exercise prediction.
@@ -366,7 +368,11 @@ index 00000000..5c2158f3
 +                }
 +                lists.append(true);
 +            }
-+            let width = if batch_index == 0 { 512 } else { 8 };
++            let width = match (growing_strings, batch_index == 0) {
++                (true, true) => 64,
++                (true, false) | (false, true) => 512,
++                (false, false) => 8,
++            };
 +            let batch = RecordBatch::try_from_iter(vec![
 +                (
 +                    "partition",
@@ -467,7 +473,7 @@ index 00000000..5c2158f3
 +    Ok(())
 +}
 diff --git a/datafusion/datasource-parquet/src/sink.rs b/datafusion/datasource-parquet/src/sink.rs
-index 725b4c74..ad5082eb 100644
+index 725b4c74..c1cb4227 100644
 --- a/datafusion/datasource-parquet/src/sink.rs
 +++ b/datafusion/datasource-parquet/src/sink.rs
 @@ -65,6 +65,7 @@ use parquet::file::properties::{
@@ -719,7 +725,7 @@ index 725b4c74..ad5082eb 100644
  fn spawn_parquet_parallel_serialization_task(
      row_group_writer_factory: ArrowRowGroupWriterFactory,
      mut data: Receiver<RecordBatch>,
-@@ -743,98 +849,102 @@ fn spawn_parquet_parallel_serialization_task(
+@@ -743,98 +849,99 @@ fn spawn_parquet_parallel_serialization_task(
      encoding_time: Time,
  ) -> SpawnedTask<Result<(), DataFusionError>> {
      SpawnedTask::spawn(async move {
@@ -757,10 +763,6 @@ index 725b4c74..ad5082eb 100644
 +            if batch.num_rows() == 0 {
 +                continue;
 +            }
-+            // Preserve ArrowWriter's row-first, then byte-based recursive
-+            // slicing order without recursive async calls. No allocation or
-+            // batch slice is needed when the whole batch fits.
-+            let mut pending = Vec::new();
              loop {
 -                if current_rg_rows + rb.num_rows() < max_row_group_rows {
 -                    send_arrays_to_col_writers(
@@ -780,12 +782,7 @@ index 725b4c74..ad5082eb 100644
 -                        Arc::clone(&ctx.schema),
 -                    )
 -                    .await?;
-+                let row_budget = max_rows - group.rows;
-+                if batch.num_rows() > row_budget {
-+                    pending.push(batch.slice(row_budget, batch.num_rows() - row_budget));
-+                    batch = batch.slice(0, row_budget);
-+                }
- 
+-
 -                    // Signal the parallel column writers that the RowGroup is done, join and finalize RowGroup
 -                    // on a separate task, so that we can immediately start on the next RG before waiting
 -                    // for the current one to finish.
@@ -801,6 +798,10 @@ index 725b4c74..ad5082eb 100644
 -                    // else hit an error, and the plan is shutting down).
 -                    if serialize_tx.send(finalize_rg_task).await.is_err() {
 -                        return Ok(());
++                // Match ArrowWriter by choosing one split point from both
++                // limits before slicing, so the remainder stays together.
++                let mut rows_to_write = batch.num_rows().min(max_rows - group.rows);
++
 +                if let Some(limit) = max_bytes.filter(|_| group.rows > 0) {
 +                    let bytes = group.estimated_bytes();
 +                    let avg = bytes / group.rows;
@@ -825,13 +826,8 @@ index 725b4c74..ad5082eb 100644
 +                            return Ok(());
 +                        }
 +                        continue;
-+                    }
-+                    if batch.num_rows() > byte_budget {
-+                        pending.push(
-+                            batch.slice(byte_budget, batch.num_rows() - byte_budget),
-+                        );
-+                        batch = batch.slice(0, byte_budget);
                      }
++                    rows_to_write = rows_to_write.min(byte_budget);
 +                }
  
 -                    current_rg_rows = 0;
@@ -847,6 +843,14 @@ index 725b4c74..ad5082eb 100644
 -                            &ctx.pool,
 -                            &encoding_time,
 -                        )?;
++                let remaining = if rows_to_write < batch.num_rows() {
++                    let remaining =
++                        batch.slice(rows_to_write, batch.num_rows() - rows_to_write);
++                    batch = batch.slice(0, rows_to_write);
++                    Some(remaining)
++                } else {
++                    None
++                };
 +                group.write(&batch, Arc::clone(&ctx.schema)).await?;
 +                let full = if group.rows == max_rows {
 +                    // This boundary is already fixed. Finalization and the
@@ -871,7 +875,7 @@ index 725b4c74..ad5082eb 100644
 +                {
 +                    return Ok(());
 +                }
-+                match pending.pop() {
++                match remaining {
 +                    Some(next) => batch = next,
 +                    None => break,
                  }
