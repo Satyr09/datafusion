@@ -15,87 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Parallel Parquet review validation
-
+name: Parallel Parquet stack refresh
 on:
   push:
     branches:
       - daipayan/parallel-max-row-group-bytes-review-validation
   workflow_dispatch:
-    inputs:
-      run_benchmarks:
-        description: Run the existing SQL benchmark comparison as well
-        type: boolean
-        default: false
-
-concurrency:
-  group: parallel-parquet-review-${{ github.sha }}
-  cancel-in-progress: false
-
 permissions:
   contents: read
-
+concurrency:
+  group: parallel-parquet-stack-${{ github.sha }}
+  cancel-in-progress: false
 jobs:
-  comparison:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_benchmarks }}
+  validation:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      TOKIO_WORKER_THREADS: 4
-      RUSTUP_TOOLCHAIN: 1.97.0
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          path: control
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: 5bf6aef8e37c91d882c0f75b772201d62733c88f
-          path: engine
-      - name: Install toolchain and metadata reader
-        run: |
-          rustup toolchain install 1.97.0 --profile minimal
-          python3 -m venv metadata-venv
-          metadata-venv/bin/python -m pip install pyarrow==25.0.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          workspaces: engine -> ../target
-          shared-key: parallel-parquet-197
-          cache-on-failure: true
-          cache-workspace-crates: true
-      - name: Build original writer
-        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results build-base
-      - name: Smoke-test original writer
-        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results smoke-base
-      - name: Build reviewed writer
-        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results build-reviewed
-      - name: Smoke-test reviewed writer
-        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results smoke-reviewed
-      - name: Build revised writer
-        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results build-revised
-      - name: Smoke-test revised writer
-        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results smoke-revised
-      - name: Run both comparison rounds
-        run: metadata-venv/bin/python control/benchmark-validation/run.py engine results compare
-      - name: Publish comparison summary
-        if: success()
-        run: cat results/reports/comparison.md >> "$GITHUB_STEP_SUMMARY"
-      - name: Preserve logs and measurements
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: parallel-parquet-comparison
-          path: results/reports
-          retention-days: 30
-
-  regression:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      RUSTUP_TOOLCHAIN: 1.97.0
+      RUSTUP_TOOLCHAIN: 1.99.0
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -103,45 +41,64 @@ jobs:
           path: control
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 61bcdc925eae161fec9cd2f2d2b4d8c12a7ffbd1
+          repository: apache/datafusion
+          ref: 2566bc1052b32cce327b11d196a4dade52dd57d8
           path: engine
           submodules: true
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y protobuf-compiler
-          rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: engine -> ../target
-          shared-key: parallel-parquet-review-tests
+          shared-key: parallel-parquet-stack-199
           cache-on-failure: true
           cache-workspace-crates: true
-      - name: Apply storage-failure test candidate
-        run: cp control/benchmark-validation/test-fixtures/write_errors.rs engine/datafusion/core/tests/parquet/write_errors.rs
-      - name: Check formatting
-        working-directory: engine
-        run: cargo fmt --all --check
-      - name: Test revised writer and verify regressions against earlier stages
-        run: python3 control/benchmark-validation/check_regressions.py engine regression-results
-      - name: Clippy for changed packages with all targets and features
-        working-directory: engine
-        run: |
-          cargo clippy --locked --all-targets --all-features \
-            -p datafusion -p datafusion-common -p datafusion-datasource-parquet \
-            -- -D warnings 2>&1 | tee ../regression-results/changed-packages-all-features.log
-      - name: Extended workspace tests
-        working-directory: engine
-        run: |
-          cargo test --locked --profile ci \
-            --exclude datafusion-examples --exclude datafusion-benchmarks --exclude datafusion-cli \
-            --workspace --lib --tests --bins \
-            --features avro,json,backtrace,extended_tests,recursive_protection,parquet_encryption \
-            2>&1 | tee ../regression-results/extended-workspace.log
-      - name: Preserve regression logs
+      - name: Validate every stage before committing the refreshed branches
+        run: python3 control/stack-validation/validate_stack.py engine control validation-results
+      - name: Preserve validation results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: parallel-parquet-review-regressions
-          path: regression-results
+          name: parallel-parquet-stack-validation
+          path: validation-results
+          retention-days: 30
+  benchmarks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      TOKIO_WORKER_THREADS: 4
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: control
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: apache/datafusion
+          ref: 2566bc1052b32cce327b11d196a4dade52dd57d8
+          path: engine
+      - name: Install dependencies
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          python3 -m venv metadata-venv
+          metadata-venv/bin/python -m pip install pyarrow==25.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: engine -> ../target
+          shared-key: parallel-parquet-stack-bench-199
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - name: Compare upstream, prerequisites, and byte-target implementation
+        run: metadata-venv/bin/python control/benchmark-validation/run_stack.py engine benchmark-results all
+      - name: Preserve benchmark results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: parallel-parquet-stack-benchmarks
+          path: benchmark-results/reports
           retention-days: 30

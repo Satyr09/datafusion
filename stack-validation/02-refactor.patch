@@ -1,0 +1,410 @@
+diff --git a/datafusion/core/tests/parquet/mod.rs b/datafusion/core/tests/parquet/mod.rs
+index 308d7176..2073d021 100644
+--- a/datafusion/core/tests/parquet/mod.rs
++++ b/datafusion/core/tests/parquet/mod.rs
+@@ -60,6 +60,7 @@ mod schema;
+ mod schema_coercion;
+ mod string_in_list_pruning;
+ mod utils;
++mod write_errors;
+ 
+ #[cfg(test)]
+ #[ctor::ctor(unsafe)]
+diff --git a/datafusion/core/tests/parquet/write_errors.rs b/datafusion/core/tests/parquet/write_errors.rs
+new file mode 100644
+index 00000000..7633ef2d
+--- /dev/null
++++ b/datafusion/core/tests/parquet/write_errors.rs
+@@ -0,0 +1,113 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use arrow::array::{Int64Array, RecordBatch, StringArray};
++use arrow::datatypes::SchemaRef;
++use datafusion::dataframe::DataFrameWriteOptions;
++use datafusion::prelude::{SessionConfig, SessionContext};
++use datafusion_catalog::streaming::StreamingTable;
++use datafusion_common::config::ConfigNonZeroUsize;
++use datafusion_common::{Result, assert_contains};
++use datafusion_execution::TaskContext;
++use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
++use datafusion_execution::runtime_env::RuntimeEnvBuilder;
++use datafusion_physical_plan::SendableRecordBatchStream;
++use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
++use datafusion_physical_plan::streaming::PartitionStream;
++use futures::stream;
++use rstest::rstest;
++use tempfile::TempDir;
++
++#[rstest]
++#[case(None)]
++#[case(Some(1_000_000))]
++#[tokio::test]
++async fn parallel_write_returns_column_error_before_input_ends(
++    #[case] max_bytes: Option<usize>,
++) -> Result<()> {
++    let pool = Arc::new(GreedyMemoryPool::new(128 * 1024));
++    let runtime = RuntimeEnvBuilder::new()
++        .with_memory_pool(pool.clone())
++        .build_arc()?;
++    let mut config = SessionConfig::new()
++        .with_batch_size(128)
++        .with_target_partitions(1);
++    let options = &mut config.options_mut().execution;
++    options.minimum_parallel_output_files = ConfigNonZeroUsize::try_new(1)?;
++    options.parquet.max_row_group_size = usize::MAX;
++    options.parquet.maximum_buffered_record_batches_per_stream = 1;
++    if let Some(limit) = max_bytes {
++        config.options_mut().set(
++            "datafusion.execution.parquet.max_row_group_bytes",
++            &limit.to_string(),
++        )?;
++    }
++    let ctx = SessionContext::new_with_config_rt(config, runtime);
++    let batch = RecordBatch::try_from_iter(vec![
++        ("id", Arc::new(Int64Array::from_iter_values(0..128)) as _),
++        (
++            "payload",
++            Arc::new(StringArray::from_iter_values(
++                (0..128).map(|i| format!("{i}{}", "x".repeat(8192))),
++            )) as _,
++        ),
++    ])?;
++    let source =
++        StreamingTable::try_new(batch.schema(), vec![Arc::new(RepeatingBatch(batch))])?;
++    let output = TempDir::new()?;
++    let error = tokio::time::timeout(
++        Duration::from_secs(10),
++        ctx.read_table(Arc::new(source))?.write_parquet(
++            output.path().to_str().unwrap(),
++            DataFrameWriteOptions::new(),
++            None,
++        ),
++    )
++    .await
++    .expect("the writer kept consuming input after a column failed")
++    .expect_err("the column encoder should exceed the memory limit");
++    assert_contains!(error.to_string(), "ParquetSink(ArrowColumnWriter)");
++    tokio::time::timeout(Duration::from_secs(10), async {
++        while pool.reserved() != 0 {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("failed writer retained memory");
++    Ok(())
++}
++
++/// Keep input available so the test cannot pass by reporting the error at EOF.
++#[derive(Debug)]
++struct RepeatingBatch(RecordBatch);
++
++impl PartitionStream for RepeatingBatch {
++    fn schema(&self) -> &SchemaRef {
++        self.0.schema_ref()
++    }
++
++    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
++        let batch = self.0.clone();
++        Box::pin(RecordBatchStreamAdapter::new(
++            batch.schema(),
++            stream::repeat_with(move || Ok(batch.clone())),
++        ))
++    }
++}
+diff --git a/datafusion/datasource-parquet/src/sink.rs b/datafusion/datasource-parquet/src/sink.rs
+index 725b4c74..d29e8671 100644
+--- a/datafusion/datasource-parquet/src/sink.rs
++++ b/datafusion/datasource-parquet/src/sink.rs
+@@ -614,39 +614,6 @@ async fn column_serializer_task(
+ type ColumnWriterTask = SpawnedTask<Result<(ArrowColumnWriter, MemoryReservation)>>;
+ type ColSender = Sender<ArrowLeafColumn>;
+ 
+-/// Spawns a parallel serialization task for each column
+-/// Returns join handles for each columns serialization task along with a send channel
+-/// to send arrow arrays to each serialization task.
+-fn spawn_column_parallel_row_group_writer(
+-    col_writers: Vec<ArrowColumnWriter>,
+-    max_buffer_size: usize,
+-    pool: &Arc<dyn MemoryPool>,
+-    encoding_time: &Time,
+-) -> Result<(Vec<ColumnWriterTask>, Vec<ColSender>)> {
+-    let num_columns = col_writers.len();
+-
+-    let mut col_writer_tasks = Vec::with_capacity(num_columns);
+-    let mut col_array_channels = Vec::with_capacity(num_columns);
+-    for writer in col_writers.into_iter() {
+-        // Buffer size of this channel limits the number of arrays queued up for column level serialization
+-        let (send_array, receive_array) =
+-            mpsc::channel::<ArrowLeafColumn>(max_buffer_size);
+-        col_array_channels.push(send_array);
+-
+-        let reservation =
+-            MemoryConsumer::new("ParquetSink(ArrowColumnWriter)").register(pool);
+-        let task = SpawnedTask::spawn(column_serializer_task(
+-            receive_array,
+-            writer,
+-            reservation,
+-            encoding_time.clone(),
+-        ));
+-        col_writer_tasks.push(task);
+-    }
+-
+-    Ok((col_writer_tasks, col_array_channels))
+-}
+-
+ /// Settings related to writing parquet files in parallel
+ #[derive(Clone)]
+ struct ParallelParquetWriterOptions {
+@@ -678,6 +645,7 @@ type RBStreamSerializeResult = Result<(Vec<ArrowColumnChunk>, MemoryReservation,
+ /// parallel column serializers.
+ async fn send_arrays_to_col_writers(
+     col_array_channels: &[ColSender],
++    column_writer_tasks: &mut Vec<ColumnWriterTask>,
+     rb: &RecordBatch,
+     schema: Arc<Schema>,
+ ) -> Result<()> {
+@@ -685,10 +653,11 @@ async fn send_arrays_to_col_writers(
+     let mut next_channel = 0;
+     for (array, field) in rb.columns().iter().zip(schema.fields()) {
+         for c in compute_leaves(field, array)? {
+-            // Do not surface error from closed channel (means something
+-            // else hit an error, and the plan is shutting down).
+             if col_array_channels[next_channel].send(c).await.is_err() {
+-                return Ok(());
++                return column_writer_error(
++                    column_writer_tasks.swap_remove(next_channel),
++                )
++                .await;
+             }
+ 
+             next_channel += 1;
+@@ -698,6 +667,16 @@ async fn send_arrays_to_col_writers(
+     Ok(())
+ }
+ 
++/// Join a failed worker so its original error reaches the caller immediately.
++async fn column_writer_error(task: ColumnWriterTask) -> Result<()> {
++    task.join_unwind()
++        .await
++        .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
++    Err(internal_datafusion_err!(
++        "Parquet column writer exited before completing its input"
++    ))
++}
++
+ /// Spawns a tokio task which joins the parallel column writer tasks,
+ /// and finalizes the row group
+ fn spawn_rg_join_and_finalize_task(
+@@ -727,6 +706,77 @@ fn spawn_rg_join_and_finalize_task(
+     })
+ }
+ 
++/// Column tasks and input channels for one row group.
++struct InProgressRowGroup {
++    column_writer_handles: Vec<ColumnWriterTask>,
++    col_array_channels: Vec<ColSender>,
++    rows: usize,
++}
++
++impl InProgressRowGroup {
++    fn new(
++        factory: &ArrowRowGroupWriterFactory,
++        index: usize,
++        ctx: &ParquetFileWriteContext,
++        encoding_time: &Time,
++    ) -> Result<Self> {
++        let writers = factory.create_column_writers(index)?;
++        let mut group = Self {
++            column_writer_handles: Vec::with_capacity(writers.len()),
++            col_array_channels: Vec::with_capacity(writers.len()),
++            rows: 0,
++        };
++        for writer in writers {
++            let (tx, rx) = mpsc::channel(
++                ctx.parallel_options.max_buffered_record_batches_per_stream,
++            );
++            let reservation =
++                MemoryConsumer::new("ParquetSink(ArrowColumnWriter)").register(&ctx.pool);
++            group
++                .column_writer_handles
++                .push(SpawnedTask::spawn(column_serializer_task(
++                    rx,
++                    writer,
++                    reservation,
++                    encoding_time.clone(),
++                )));
++            group.col_array_channels.push(tx);
++        }
++        Ok(group)
++    }
++
++    async fn write(&mut self, batch: &RecordBatch, schema: Arc<Schema>) -> Result<()> {
++        send_arrays_to_col_writers(
++            &self.col_array_channels,
++            &mut self.column_writer_handles,
++            batch,
++            schema,
++        )
++        .await?;
++        self.rows += batch.num_rows();
++        Ok(())
++    }
++
++    fn finish(
++        self,
++        pool: &Arc<dyn MemoryPool>,
++        encoding_time: &Time,
++    ) -> SpawnedTask<RBStreamSerializeResult> {
++        let Self {
++            column_writer_handles,
++            col_array_channels,
++            rows,
++        } = self;
++        drop(col_array_channels);
++        spawn_rg_join_and_finalize_task(
++            column_writer_handles,
++            rows,
++            pool,
++            encoding_time.clone(),
++        )
++    }
++}
++
+ /// This task coordinates the serialization of a parquet file in parallel.
+ /// As the query produces RecordBatches, these are written to a RowGroup
+ /// via parallel [ArrowColumnWriter] tasks. Once the desired max rows per
+@@ -743,93 +793,50 @@ fn spawn_parquet_parallel_serialization_task(
+     encoding_time: Time,
+ ) -> SpawnedTask<Result<(), DataFusionError>> {
+     SpawnedTask::spawn(async move {
+-        let max_buffer_rb = ctx.parallel_options.max_buffered_record_batches_per_stream;
+         let max_row_group_rows = ctx
+             .props
+             .max_row_group_row_count()
+             .unwrap_or(DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
+         let mut row_group_index = 0;
+-        let col_writers =
+-            row_group_writer_factory.create_column_writers(row_group_index)?;
+-        let (mut column_writer_handles, mut col_array_channels) =
+-            spawn_column_parallel_row_group_writer(
+-                col_writers,
+-                max_buffer_rb,
+-                &ctx.pool,
+-                &encoding_time,
+-            )?;
+-        let mut current_rg_rows = 0;
++        let mut group = InProgressRowGroup::new(
++            &row_group_writer_factory,
++            row_group_index,
++            &ctx,
++            &encoding_time,
++        )?;
+ 
+         while let Some(mut rb) = data.recv().await {
+-            // This loop allows the "else" block to repeatedly split the RecordBatch to handle the case
+-            // when max_row_group_rows < execution.batch_size as an alternative to a recursive async
+-            // function.
++            // Split batches that cross a row-group boundary.
+             loop {
+-                if current_rg_rows + rb.num_rows() < max_row_group_rows {
+-                    send_arrays_to_col_writers(
+-                        &col_array_channels,
+-                        &rb,
+-                        Arc::clone(&ctx.schema),
+-                    )
+-                    .await?;
+-                    current_rg_rows += rb.num_rows();
++                if group.rows + rb.num_rows() < max_row_group_rows {
++                    group.write(&rb, Arc::clone(&ctx.schema)).await?;
+                     break;
+                 } else {
+-                    let rows_left = max_row_group_rows - current_rg_rows;
+-                    let a = rb.slice(0, rows_left);
+-                    send_arrays_to_col_writers(
+-                        &col_array_channels,
+-                        &a,
+-                        Arc::clone(&ctx.schema),
+-                    )
+-                    .await?;
++                    let rows_left = max_row_group_rows - group.rows;
++                    group
++                        .write(&rb.slice(0, rows_left), Arc::clone(&ctx.schema))
++                        .await?;
+ 
+-                    // Signal the parallel column writers that the RowGroup is done, join and finalize RowGroup
+-                    // on a separate task, so that we can immediately start on the next RG before waiting
+-                    // for the current one to finish.
+-                    drop(col_array_channels);
+-                    let finalize_rg_task = spawn_rg_join_and_finalize_task(
+-                        column_writer_handles,
+-                        max_row_group_rows,
+-                        &ctx.pool,
+-                        encoding_time.clone(),
+-                    );
+-
+-                    // Do not surface error from closed channel (means something
+-                    // else hit an error, and the plan is shutting down).
++                    // Finalization can overlap with encoding the next row group.
++                    let finalize_rg_task = group.finish(&ctx.pool, &encoding_time);
+                     if serialize_tx.send(finalize_rg_task).await.is_err() {
+                         return Ok(());
+                     }
+ 
+-                    current_rg_rows = 0;
+                     rb = rb.slice(rows_left, rb.num_rows() - rows_left);
+-
+                     row_group_index += 1;
+-                    let col_writers = row_group_writer_factory
+-                        .create_column_writers(row_group_index)?;
+-                    (column_writer_handles, col_array_channels) =
+-                        spawn_column_parallel_row_group_writer(
+-                            col_writers,
+-                            max_buffer_rb,
+-                            &ctx.pool,
+-                            &encoding_time,
+-                        )?;
++                    group = InProgressRowGroup::new(
++                        &row_group_writer_factory,
++                        row_group_index,
++                        &ctx,
++                        &encoding_time,
++                    )?;
+                 }
+             }
+         }
+ 
+-        drop(col_array_channels);
+-        // Handle leftover rows as final rowgroup, which may be smaller than max_row_group_rows
+-        if current_rg_rows > 0 {
+-            let finalize_rg_task = spawn_rg_join_and_finalize_task(
+-                column_writer_handles,
+-                current_rg_rows,
+-                &ctx.pool,
+-                encoding_time.clone(),
+-            );
+-
+-            // Do not surface error from closed channel (means something
+-            // else hit an error, and the plan is shutting down).
++        if group.rows > 0 {
++            let finalize_rg_task = group.finish(&ctx.pool, &encoding_time);
+             if serialize_tx.send(finalize_rg_task).await.is_err() {
+                 return Ok(());
+             }
